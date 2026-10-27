@@ -50,6 +50,7 @@ User=ollama
 Group=ollama
 Restart=always
 RestartSec=3
+PrivateTmp=true
 
 [Install]
 WantedBy=default.target

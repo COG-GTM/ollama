@@ -110,6 +110,7 @@ Group=ollama
 Restart=always
 RestartSec=3
 Environment="PATH=$PATH"
+PrivateTmp=true
 
 [Install]
 WantedBy=default.target

@@ -80,6 +80,10 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		opts.NumCtx = 4
 	}
 
+	if err := ensurePayloads(); err != nil {
+		return nil, err
+	}
+
 	cpuRunner := ""
 	var estimatedVRAM uint64
 	var systemMemory uint64
@@ -214,6 +218,13 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			continue
 		}
 
+		dir, server, err := trustedServer(servers[i], dir)
+		if err != nil {
+			finalErr = fmt.Errorf("[%d] server %s unavailable: %w", i, servers[i], err)
+			slog.Warn("unable to use llama server", "variant", servers[i], "error", err)
+			continue
+		}
+
 		// Find an availableServers  port, retry on each iterration in case the failure was a port conflict race
 		port := 0
 		if a, err := net.ResolveTCPAddr("tcp", "localhost:0"); err == nil {
@@ -248,22 +259,6 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		if gpus[0].DependencyPath != "" {
 			// TODO refine for multi-gpu support
 			libraryPaths = append([]string{gpus[0].DependencyPath}, libraryPaths...)
-		}
-
-		server := filepath.Join(dir, "ollama_llama_server")
-		if runtime.GOOS == "windows" {
-			server = server + ".exe"
-		}
-
-		// Detect tmp cleaners wiping out the file
-		_, err := os.Stat(server)
-		if errors.Is(err, os.ErrNotExist) {
-			slog.Warn("llama server disappeared, reinitializing payloads", "path", server, "error", err)
-			err = Init()
-			if err != nil {
-				slog.Warn("failed to reinitialize payloads", "error", err)
-				return nil, err
-			}
 		}
 
 		s := &llmServer{
@@ -312,6 +307,41 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 
 	slog.Error("unable to load any llama server", "error", finalErr)
 	return nil, finalErr
+}
+
+func serverBinary(dir string) string {
+	server := filepath.Join(dir, "ollama_llama_server")
+	if runtime.GOOS == "windows" {
+		server = server + ".exe"
+	}
+	return server
+}
+
+// trustedServer returns the runner directory and binary for variant. If the
+// binary is missing (e.g. removed by a tmp cleaner) or its directory can no
+// longer be trusted, payloads are re-extracted into a fresh directory.
+func trustedServer(variant, dir string) (string, string, error) {
+	server := serverBinary(dir)
+	err := gpu.VerifyPayload(server)
+	if err == nil {
+		return dir, server, nil
+	}
+
+	slog.Warn("llama server missing or untrusted, reinitializing payloads", "path", server, "error", err)
+	gpu.ResetPayloadsDir()
+	if err := Init(); err != nil {
+		return "", "", err
+	}
+
+	dir = availableServers()[variant]
+	if dir == "" {
+		return "", "", fmt.Errorf("server %s not found after reinitializing payloads", variant)
+	}
+	server = serverBinary(dir)
+	if err := gpu.VerifyPayload(server); err != nil {
+		return "", "", err
+	}
+	return dir, server, nil
 }
 
 func projectorMemoryRequirements(filename string) uint64 {

@@ -47,6 +47,21 @@ func Init() error {
 	return nil
 }
 
+// ensurePayloads re-extracts the runners if the payload directory is missing or
+// untrusted, e.g. after a tmp cleaner removed it and a fresh one was created.
+func ensurePayloads() error {
+	payloadsDir, err := gpu.PayloadsDir()
+	if err != nil {
+		return err
+	}
+	if err := gpu.VerifyPayloadDir(payloadsDir); err != nil {
+		slog.Warn("payload directory missing or untrusted, reinitializing payloads", "dir", payloadsDir, "error", err)
+		gpu.ResetPayloadsDir()
+		return Init()
+	}
+	return nil
+}
+
 // binary names may contain an optional variant separated by '_'
 // For example, "ollama_rocm_v6" and "ollama_rocm_v5" or "ollama_cpu" and "ollama_cpu_avx2"
 // Any library without a variant is the lowest common denominator
@@ -169,6 +184,11 @@ func extractFiles(targetDir string, glob string) error {
 		return fmt.Errorf("extractFiles could not mkdir %s: %v", targetDir, err)
 	}
 
+	// Files in our private temp dir are always rewritten so nothing left in
+	// place by someone else is ever reused. Operator supplied runner dirs keep
+	// any files that already exist.
+	overwrite := gpu.IsTemporaryPayloadsDir(targetDir)
+
 	g := new(errgroup.Group)
 
 	// build/$OS/$GOARCH/$VARIANT/{bin,lib}/$FILE
@@ -200,22 +220,15 @@ func extractFiles(targetDir string, glob string) error {
 				return fmt.Errorf("extractFiles could not mkdir %s: %v", variantDir, err)
 			}
 
-			base := filepath.Base(filename)
-			destFilename := filepath.Join(variantDir, base)
+			if overwrite {
+				if err := gpu.VerifyPayloadDir(variantDir); err != nil {
+					return fmt.Errorf("extractFiles untrusted payload dir %s: %v", variantDir, err)
+				}
+			}
 
-			_, err = os.Stat(destFilename)
-			switch {
-			case errors.Is(err, os.ErrNotExist):
-				destFile, err := os.OpenFile(destFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
-				if err != nil {
-					return fmt.Errorf("write payload %s: %v", filename, err)
-				}
-				defer destFile.Close()
-				if _, err := io.Copy(destFile, src); err != nil {
-					return fmt.Errorf("copy payload %s: %v", filename, err)
-				}
-			case err != nil:
-				return fmt.Errorf("stat payload %s: %v", filename, err)
+			destFilename := filepath.Join(variantDir, filepath.Base(filename))
+			if err := writePayload(destFilename, src, overwrite); err != nil {
+				return fmt.Errorf("write payload %s: %v", filename, err)
 			}
 			return nil
 		})
@@ -228,4 +241,37 @@ func extractFiles(targetDir string, glob string) error {
 		return err
 	}
 	return nil
+}
+
+// writePayload atomically writes src to destFilename via a temp file and rename,
+// which replaces (never follows) whatever is already at destFilename. Unless
+// overwrite is set, an existing destFilename is kept as is.
+func writePayload(destFilename string, src io.Reader, overwrite bool) error {
+	if !overwrite {
+		_, err := os.Lstat(destFilename)
+		switch {
+		case err == nil:
+			return nil
+		case !errors.Is(err, os.ErrNotExist):
+			return err
+		}
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(destFilename), "."+filepath.Base(destFilename)+".*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	if _, err := io.Copy(tmp, src); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), destFilename)
 }
