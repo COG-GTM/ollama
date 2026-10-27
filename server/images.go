@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -1041,7 +1040,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 
 	manifest, err = pullModelManifest(ctx, mp, regOpts)
 	if err != nil {
-		return fmt.Errorf("pull model manifest: %s", err)
+		return fmt.Errorf("pull model manifest: %w", err)
 	}
 
 	var layers []*Layer
@@ -1131,18 +1130,35 @@ func pullModelManifest(ctx context.Context, mp ModelPath, regOpts *registryOptio
 		return nil, err
 	}
 
+	if m == nil || m.Config == nil {
+		return nil, errors.New("invalid manifest: missing config")
+	}
+
+	if err := ValidateDigest(m.Config.Digest); err != nil {
+		return nil, fmt.Errorf("invalid manifest config: %w", err)
+	}
+
+	for _, layer := range m.Layers {
+		if layer == nil {
+			return nil, errors.New("invalid manifest: missing layer")
+		}
+		if err := ValidateDigest(layer.Digest); err != nil {
+			return nil, fmt.Errorf("invalid manifest layer: %w", err)
+		}
+	}
+
 	return m, err
 }
 
 // GetSHA256Digest returns the SHA256 hash of a given buffer and returns it, and the size of buffer
-func GetSHA256Digest(r io.Reader) (string, int64) {
+func GetSHA256Digest(r io.Reader) (string, int64, error) {
 	h := sha256.New()
 	n, err := io.Copy(h, r)
 	if err != nil {
-		log.Fatal(err)
+		return "", 0, err
 	}
 
-	return fmt.Sprintf("sha256:%x", h.Sum(nil)), n
+	return fmt.Sprintf("sha256:%x", h.Sum(nil)), n, nil
 }
 
 var errUnauthorized = fmt.Errorf("unauthorized: access denied")
@@ -1313,15 +1329,37 @@ func verifyBlob(digest string) error {
 		return err
 	}
 
+	return verifyFile(fp, digest)
+}
+
+// verifyFile returns errDigestMismatch if the SHA256 of the regular file at fp doesn't match digest.
+func verifyFile(fp, digest string) error {
+	if err := ValidateDigest(digest); err != nil {
+		return err
+	}
+
+	fi, err := os.Lstat(fp)
+	if err != nil {
+		return err
+	}
+
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%w: %s is not a regular file", errDigestMismatch, fp)
+	}
+
 	f, err := os.Open(fp)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	fileDigest, _ := GetSHA256Digest(f)
-	if digest != fileDigest {
-		return fmt.Errorf("%w: want %s, got %s", errDigestMismatch, digest, fileDigest)
+	fileDigest, _, err := GetSHA256Digest(f)
+	if err != nil {
+		return err
+	}
+
+	if want := strings.Replace(digest, "-", ":", 1); want != fileDigest {
+		return fmt.Errorf("%w: want %s, got %s", errDigestMismatch, want, fileDigest)
 	}
 
 	return nil
