@@ -202,6 +202,15 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 		}
 	}
 
+	if err := verifyFile(file.Name(), b.Digest); err != nil {
+		if errors.Is(err, errDigestMismatch) {
+			if rmErr := os.Remove(file.Name()); rmErr != nil {
+				slog.Info(fmt.Sprintf("couldn't remove file with digest mismatch '%s': %v", file.Name(), rmErr))
+			}
+		}
+		return err
+	}
+
 	if err := os.Rename(file.Name(), b.Name); err != nil {
 		return err
 	}

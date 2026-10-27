@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -143,7 +144,27 @@ func GetManifestPath() (string, error) {
 	return path, nil
 }
 
+var (
+	ErrInvalidDigestFormat = errors.New("invalid digest format")
+	digestPattern          = regexp.MustCompile(`^sha256[:-][0-9a-f]{64}$`)
+)
+
+// ValidateDigest returns ErrInvalidDigestFormat unless digest has the form sha256:<64 hex> or sha256-<64 hex>.
+func ValidateDigest(digest string) error {
+	if !digestPattern.MatchString(digest) {
+		return fmt.Errorf("%w: %q", ErrInvalidDigestFormat, digest)
+	}
+	return nil
+}
+
 func GetBlobsPath(digest string) (string, error) {
+	// an empty digest returns the blobs directory itself
+	if digest != "" {
+		if err := ValidateDigest(digest); err != nil {
+			return "", err
+		}
+	}
+
 	dir, err := modelsDir()
 	if err != nil {
 		return "", err
