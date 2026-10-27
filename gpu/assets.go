@@ -21,6 +21,9 @@ var (
 	// hold extracted payloads. It is empty when the runners come from
 	// OLLAMA_RUNNERS_DIR or are shipped alongside the executable (Windows).
 	payloadsTmpDir = ""
+	// payloadsTmpHandle keeps the directory we created open so its inode cannot
+	// be reused, letting us detect a same-named replacement.
+	payloadsTmpHandle *os.File
 )
 
 func PayloadsDir() (string, error) {
@@ -30,9 +33,9 @@ func PayloadsDir() (string, error) {
 		// Tmp cleaners may remove our directory while we keep running, and any
 		// local user could then recreate the same path. Never reuse a temp
 		// directory that is no longer the private one we created.
-		if err := checkOwnedPath(payloadsTmpDir, true); err != nil {
+		if err := checkPayloadsRoot(payloadsTmpDir, payloadsTmpHandle); err != nil {
 			slog.Warn("payload directory is missing or no longer trusted, creating a new one", "dir", payloadsTmpDir, "error", err)
-			payloadsDir, payloadsTmpDir = "", ""
+			forgetPayloadsTmpDir()
 		}
 	}
 	if payloadsDir == "" {
@@ -95,15 +98,21 @@ func PayloadsDir() (string, error) {
 			return "", fmt.Errorf("failed to generate tmp dir: %w", err)
 		}
 
+		handle, err := os.Open(tmpDir)
+		if err != nil {
+			return "", err
+		}
+
 		// Track our pid so we can clean up orphaned tmpdirs
 		pidFilePath := filepath.Join(tmpDir, "ollama.pid")
 		if err := os.WriteFile(pidFilePath, []byte(fmt.Sprint(os.Getpid())), 0o600); err != nil {
+			handle.Close()
 			return "", err
 		}
 
 		// We create a distinct subdirectory for payloads within the tmpdir
 		// This will typically look like /tmp/ollama3208993108/runners on linux
-		payloadsTmpDir = tmpDir
+		payloadsTmpDir, payloadsTmpHandle = tmpDir, handle
 		payloadsDir = filepath.Join(tmpDir, "runners")
 	}
 	return payloadsDir, nil
@@ -117,12 +126,20 @@ func ResetPayloadsDir() {
 	if payloadsTmpDir == "" {
 		return
 	}
-	if checkOwnedPath(payloadsTmpDir, true) == nil {
+	if checkPayloadsRoot(payloadsTmpDir, payloadsTmpHandle) == nil {
 		if err := os.RemoveAll(payloadsTmpDir); err != nil {
 			slog.Debug("unable to remove payload dir", "dir", payloadsTmpDir, "error", err)
 		}
 	}
-	payloadsDir, payloadsTmpDir = "", ""
+	forgetPayloadsTmpDir()
+}
+
+// forgetPayloadsTmpDir drops the cached temporary directory. Callers must hold lock.
+func forgetPayloadsTmpDir() {
+	if payloadsTmpHandle != nil {
+		payloadsTmpHandle.Close()
+	}
+	payloadsDir, payloadsTmpDir, payloadsTmpHandle = "", "", nil
 }
 
 // IsTemporaryPayloadsDir reports whether dir is the temporary payload directory
@@ -147,7 +164,7 @@ func VerifyPayloadDir(path string) error {
 
 func verifyPayloadPath(path string, wantDir bool) error {
 	lock.Lock()
-	root := payloadsTmpDir
+	root, rootHandle := payloadsTmpDir, payloadsTmpHandle
 	lock.Unlock()
 
 	if root == "" {
@@ -168,7 +185,7 @@ func verifyPayloadPath(path string, wantDir bool) error {
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("%s is outside the payload directory %s", path, root)
 	}
-	if err := checkOwnedPath(root, true); err != nil {
+	if err := checkPayloadsRoot(root, rootHandle); err != nil {
 		return err
 	}
 	cur := root
@@ -178,6 +195,29 @@ func verifyPayloadPath(path string, wantDir bool) error {
 		if err := checkOwnedPath(cur, wantDir || i < len(parts)-1); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// checkPayloadsRoot verifies root is still the exact directory we created
+// (same device and inode as our open handle) and is still private to us.
+func checkPayloadsRoot(root string, handle *os.File) error {
+	if err := checkOwnedPath(root, true); err != nil {
+		return err
+	}
+	if handle == nil {
+		return fmt.Errorf("%s is not tracked", root)
+	}
+	created, err := handle.Stat()
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(created, info) {
+		return fmt.Errorf("%s was replaced after it was created", root)
 	}
 	return nil
 }
@@ -201,7 +241,9 @@ func checkOwnedPath(path string, wantDir bool) error {
 	return checkOwner(path, info)
 }
 
-// Best effort to clean up prior tmpdirs
+// Best effort to clean up prior tmpdirs. Only directories that look like ones
+// we created (ollama<digits>, owned by us, containing our ollama.pid) whose
+// process is gone are removed.
 func cleanupTmpDirs(parentDir string) {
 	if parentDir == "" {
 		parentDir = os.TempDir()
@@ -211,24 +253,32 @@ func cleanupTmpDirs(parentDir string) {
 		return
 	}
 	for _, d := range dirs {
+		suffix := strings.TrimPrefix(filepath.Base(d), "ollama")
+		if _, err := strconv.ParseUint(suffix, 10, 64); err != nil {
+			continue
+		}
 		// Only consider real directories we own; never follow symlinks or touch other users' files
 		if checkOwnedPath(d, true) != nil {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(d, "ollama.pid"))
-		if err == nil {
-			pid, err := strconv.Atoi(string(raw))
-			if err == nil {
-				if proc, err := os.FindProcess(int(pid)); err == nil && !errors.Is(proc.Signal(syscall.Signal(0)), os.ErrProcessDone) {
-					// Another running ollama, ignore this tmpdir
-					continue
-				}
-			}
-		} else {
-			slog.Debug("failed to open ollama.pid", "path", d, "error", err)
+		pidFile := filepath.Join(d, "ollama.pid")
+		if err := checkOwnedPath(pidFile, false); err != nil {
+			slog.Debug("skipping tmpdir without ollama.pid", "path", d, "error", err)
+			continue
 		}
-		err = os.RemoveAll(d)
+		raw, err := os.ReadFile(pidFile)
 		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil {
+			continue
+		}
+		if proc, err := os.FindProcess(pid); err == nil && !errors.Is(proc.Signal(syscall.Signal(0)), os.ErrProcessDone) {
+			// Another running ollama, ignore this tmpdir
+			continue
+		}
+		if err := os.RemoveAll(d); err != nil {
 			slog.Debug("unable to cleanup stale tmpdir", "path", d, "error", err)
 		}
 	}
@@ -242,7 +292,7 @@ func Cleanup() {
 	}
 	// We want to fully clean up the tmpdir parent of the payloads dir, but only if it is still ours
 	tmpDir := payloadsTmpDir
-	if err := checkOwnedPath(tmpDir, true); err != nil {
+	if err := checkPayloadsRoot(tmpDir, payloadsTmpHandle); err != nil {
 		slog.Warn("not cleaning up untrusted payload dir", "dir", tmpDir, "error", err)
 		return
 	}

@@ -3,7 +3,9 @@
 package gpu
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -17,11 +19,11 @@ func setupPayloadsTest(t *testing.T) string {
 	t.Setenv("OLLAMA_RUNNERS_DIR", "")
 	t.Setenv("OLLAMA_TMPDIR", parent)
 	lock.Lock()
-	payloadsDir, payloadsTmpDir = "", ""
+	forgetPayloadsTmpDir()
 	lock.Unlock()
 	t.Cleanup(func() {
 		lock.Lock()
-		payloadsDir, payloadsTmpDir = "", ""
+		forgetPayloadsTmpDir()
 		lock.Unlock()
 	})
 	return parent
@@ -182,20 +184,55 @@ func TestRunnersDirIsNotTemporary(t *testing.T) {
 	assert.NoError(t, err, "operator supplied runners dir must never be removed")
 }
 
-func TestCleanupTmpDirsSkipsSymlinks(t *testing.T) {
+func TestPayloadsDirNotReusedWhenRecreatedPrivately(t *testing.T) {
+	setupPayloadsTest(t)
+
+	dir, err := PayloadsDir()
+	require.NoError(t, err)
+	tmpDir := filepath.Dir(dir)
+
+	// Recreated with the same owner and a private mode, but not the directory we made
+	require.NoError(t, os.RemoveAll(tmpDir))
+	require.NoError(t, os.Mkdir(tmpDir, 0o700))
+	planted := plantRunner(t, filepath.Join(tmpDir, "runners"), 0o755)
+
+	assert.ErrorContains(t, VerifyPayload(planted), "replaced")
+
+	fresh, err := PayloadsDir()
+	require.NoError(t, err)
+	assert.NotEqual(t, dir, fresh)
+}
+
+func TestCleanupTmpDirs(t *testing.T) {
 	parent := setupPayloadsTest(t)
 
 	victim := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(victim, "keep"), []byte("x"), 0o600))
-	require.NoError(t, os.Symlink(victim, filepath.Join(parent, "ollama-link")))
+	require.NoError(t, os.Symlink(victim, filepath.Join(parent, "ollama123")))
 
-	stale := filepath.Join(parent, "ollama-stale")
+	unrelated := filepath.Join(parent, "ollama-models")
+	require.NoError(t, os.Mkdir(unrelated, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(unrelated, "blob"), []byte("x"), 0o600))
+
+	noPid := filepath.Join(parent, "ollama456")
+	require.NoError(t, os.Mkdir(noPid, 0o700))
+
+	dead := exec.Command("true")
+	require.NoError(t, dead.Run())
+	stale := filepath.Join(parent, "ollama789")
 	require.NoError(t, os.Mkdir(stale, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(stale, "ollama.pid"), []byte(fmt.Sprint(dead.Process.Pid)), 0o600))
+
+	live := filepath.Join(parent, "ollama790")
+	require.NoError(t, os.Mkdir(live, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(live, "ollama.pid"), []byte(fmt.Sprint(os.Getpid())), 0o600))
 
 	cleanupTmpDirs(parent)
 
-	_, err := os.Stat(filepath.Join(victim, "keep"))
-	assert.NoError(t, err)
-	_, err = os.Lstat(stale)
+	for _, keep := range []string{filepath.Join(victim, "keep"), filepath.Join(unrelated, "blob"), noPid, live} {
+		_, err := os.Lstat(keep)
+		assert.NoError(t, err, keep)
+	}
+	_, err := os.Lstat(stale)
 	assert.ErrorIs(t, err, os.ErrNotExist)
 }

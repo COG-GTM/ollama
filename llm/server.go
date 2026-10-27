@@ -220,8 +220,9 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 
 		dir, server, err := trustedServer(servers[i], dir)
 		if err != nil {
-			slog.Warn("failed to reinitialize payloads", "error", err)
-			return nil, err
+			finalErr = fmt.Errorf("[%d] server %s unavailable: %w", i, servers[i], err)
+			slog.Warn("unable to use llama server", "variant", servers[i], "error", err)
+			continue
 		}
 
 		// Find an availableServers  port, retry on each iterration in case the failure was a port conflict race
