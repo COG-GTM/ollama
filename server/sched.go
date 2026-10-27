@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"reflect"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,13 +104,28 @@ func (s *Scheduler) GetRunner(c context.Context, model *Model, opts api.Options,
 // Returns immediately, spawns go routines for the scheduler which will shutdown when ctx is done
 func (s *Scheduler) Run(ctx context.Context) {
 	slog.Debug("starting llm scheduler")
-	go func() {
-		s.processPending(ctx)
-	}()
+	go runSchedulerLoop(ctx, "pending", s.processPending)
+	go runSchedulerLoop(ctx, "completed", s.processCompleted)
+}
 
-	go func() {
-		s.processCompleted(ctx)
-	}()
+// runSchedulerLoop runs a scheduler loop and restarts it if it panics, so a
+// bug in the scheduler doesn't take down the whole server.
+func runSchedulerLoop(ctx context.Context, name string, loop func(context.Context)) {
+	for {
+		panicked := func() (panicked bool) {
+			defer func() {
+				if r := recover(); r != nil {
+					panicked = true
+					slog.Error("scheduler loop panicked, restarting", "loop", name, "panic", r, "stack", string(debug.Stack()))
+				}
+			}()
+			loop(ctx)
+			return false
+		}()
+		if !panicked || ctx.Err() != nil {
+			return
+		}
+	}
 }
 
 func (s *Scheduler) processPending(ctx context.Context) {
@@ -128,11 +144,16 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				s.loadedMu.Unlock()
 				if runner != nil {
 					if runner.needsReload(ctx, pending) {
+						if !s.isLoaded(runner) {
+							slog.Debug("runner was unloaded while evaluating, re-evaluating", "model", pending.model.ModelPath)
+							continue
+						}
 						runnerToExpire = runner
-					} else {
-						// Runner is usable, return it
-						pending.useLoadedRunner(runner, s.finishedReqCh)
+					} else if pending.useLoadedRunner(runner, s.finishedReqCh) {
 						break
+					} else {
+						slog.Debug("runner was unloaded before it could be used, re-evaluating", "model", pending.model.ModelPath)
+						continue
 					}
 				} else if loadedMax > 0 && loadedCount >= loadedMax {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
@@ -290,12 +311,23 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 	}
 }
 
+// isLoaded reports whether runner is still the loaded runner for its model
+func (s *Scheduler) isLoaded(runner *runnerRef) bool {
+	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
+	return s.loaded[runner.model] == runner
+}
+
 // Complete the pending request and send the runner back to the requester
 // Wires up a finished event after the request context is completed
 // Updates session duration, and resets expiration timer
-func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *LlmRequest) {
+// Returns false without using the runner if it has already been unloaded
+func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *LlmRequest) bool {
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
+	if runner.llama == nil {
+		return false
+	}
 	runner.refCount++
 	if runner.expireTimer != nil {
 		runner.expireTimer.Stop()
@@ -308,6 +340,7 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 		slog.Debug("context for request finished")
 		finished <- pending
 	}()
+	return true
 }
 
 func (s *Scheduler) load(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoList) {
@@ -449,6 +482,11 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	slog.Debug("evaluating already loaded", "model", req.model.ModelPath)
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
+
+	// The runner was unloaded while we waited for the lock
+	if runner.Options == nil || runner.llama == nil {
+		return true
+	}
 
 	timeout := 10 * time.Second
 	if runner.loading {

@@ -561,6 +561,96 @@ func TestNeedsReload(t *testing.T) {
 	require.False(t, resp)
 }
 
+func TestNeedsReloadUnloadedRunner(t *testing.T) {
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer done()
+
+	do := api.DefaultOptions()
+	runner := &runnerRef{Options: &do, llama: &mockLlm{}}
+	req := &LlmRequest{model: &Model{}, opts: api.DefaultOptions()}
+	runner.unload()
+	require.True(t, runner.needsReload(ctx, req))
+}
+
+func TestUseLoadedRunnerUnloaded(t *testing.T) {
+	req := &LlmRequest{
+		ctx:       context.Background(),
+		opts:      api.DefaultOptions(),
+		successCh: make(chan *runnerRef, 1),
+	}
+	r1 := &runnerRef{llama: &mockLlm{}}
+	r1.unload()
+	require.False(t, req.useLoadedRunner(r1, make(chan *LlmRequest)))
+	require.Equal(t, uint(0), r1.refCount)
+	require.Len(t, req.successCh, 0)
+}
+
+// A request for a model that arrives while that model is being unloaded must
+// reload it rather than dereference the unloaded runner.
+func TestRequestDuringUnload(t *testing.T) {
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+
+	scenario := newScenario(t, ctx, "ollama-model-unload", 10)
+	s := InitScheduler(ctx)
+	s.getGpuFn = func() gpu.GpuInfoList {
+		return []gpu.GpuInfo{{Library: "cpu"}}
+	}
+	s.newServerFn = scenario.newServer
+
+	oldLlm := &mockLlm{closeStarted: make(chan struct{}), closeRelease: make(chan struct{})}
+	opts := api.DefaultOptions()
+	old := &runnerRef{
+		llama:   oldLlm,
+		model:   scenario.req.model.ModelPath,
+		Options: &opts,
+	}
+	s.loadedMu.Lock()
+	s.loaded[old.model] = old
+	s.loadedMu.Unlock()
+
+	s.Run(ctx)
+
+	// Start unloading and hold it in llama.Close()
+	s.expiredCh <- old
+	select {
+	case <-oldLlm.closeStarted:
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for unload to start")
+	}
+
+	// Queue a request for the same model while the unload is in progress
+	s.pendingReqCh <- scenario.req
+	time.Sleep(20 * time.Millisecond)
+	close(oldLlm.closeRelease)
+
+	select {
+	case resp := <-scenario.req.successCh:
+		require.NotSame(t, old, resp)
+		require.Equal(t, scenario.srv, resp.llama)
+	case err := <-scenario.req.errCh:
+		t.Fatalf("unexpected error: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for runner")
+	}
+	require.True(t, oldLlm.closeCalled)
+	scenario.ctxDone()
+}
+
+func TestRunSchedulerLoopRecovers(t *testing.T) {
+	ctx, done := context.WithTimeout(context.Background(), time.Second)
+	defer done()
+
+	calls := 0
+	runSchedulerLoop(ctx, "test", func(ctx context.Context) {
+		calls++
+		if calls < 3 {
+			panic("boom")
+		}
+	})
+	require.Equal(t, 3, calls)
+}
+
 func TestUnloadAllRunners(t *testing.T) {
 	ctx, done := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer done()
@@ -605,6 +695,8 @@ type mockLlm struct {
 	detonekizeRespErr error
 	closeResp         error
 	closeCalled       bool
+	closeStarted      chan struct{} // optional: closed when Close is entered
+	closeRelease      chan struct{} // optional: Close blocks until this is closed
 	estimatedVRAM     uint64
 }
 
@@ -623,6 +715,12 @@ func (s *mockLlm) Detokenize(ctx context.Context, tokens []int) (string, error) 
 	return s.detokenizeResp, s.detonekizeRespErr
 }
 func (s *mockLlm) Close() error {
+	if s.closeStarted != nil {
+		close(s.closeStarted)
+	}
+	if s.closeRelease != nil {
+		<-s.closeRelease
+	}
 	s.closeCalled = true
 	return s.closeResp
 }
