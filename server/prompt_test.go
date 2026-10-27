@@ -228,6 +228,7 @@ func TestPromptLimits(t *testing.T) {
 		{"printf star width", strings.Repeat(`{{printf "%*d" 999999 1}}`, 64), ""},
 		{"printf large precision", `{{printf "%.9999999d" 1}}`, ""},
 		{"printf large width", `{{printf "%9999999d" 1}}`, ""},
+		{"printf width sum", "{{printf .Prompt 1}}", strings.Repeat("%9999999999d", 1<<16)},
 		{"doubling variables", `{{$a := print .Prompt .Prompt}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}`, ""},
 		{"nested escaping", `{{js (js (js (js (js (js (js (js (js (js (js (js (js (js (js (js .Prompt)))))))))))))))}}`, strings.Repeat("<", 4096)},
 	}

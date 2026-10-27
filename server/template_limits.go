@@ -263,7 +263,7 @@ func formatWidths(format string, args []any) int {
 		for i++; i < len(format); i++ {
 			switch c := format[i]; {
 			case c == '*':
-				total += star
+				total = min(total+star, math.MaxInt32)
 			case c >= '0' && c <= '9':
 				// fmt accepts literal widths and precisions up to ~1e7, so
 				// saturate well above that and let the budget reject them.
@@ -271,7 +271,7 @@ func formatWidths(format string, args []any) int {
 				for ; i+1 < len(format) && format[i+1] >= '0' && format[i+1] <= '9'; i++ {
 					n = min(n*10+int(format[i]-'0'), math.MaxInt32)
 				}
-				total += min(n*10+int(format[i]-'0'), math.MaxInt32)
+				total = min(total+min(n*10+int(format[i]-'0'), math.MaxInt32), math.MaxInt32)
 			case strings.IndexByte("+-# .[]", c) >= 0:
 			default:
 				break verb
