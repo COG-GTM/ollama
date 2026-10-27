@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -58,6 +59,8 @@ func NewLayer(r io.Reader, mediatype string) (*Layer, error) {
 	sha256sum := sha256.New()
 	n, err := io.Copy(io.MultiWriter(temp, sha256sum), r)
 	if err != nil {
+		temp.Close()
+		os.Remove(temp.Name())
 		return nil, err
 	}
 
@@ -86,6 +89,19 @@ func NewLayerFromLayer(digest, mediatype, from string) (*Layer, error) {
 		Size:      fi.Size(),
 		From:      from,
 	}, nil
+}
+
+// Discard removes the uncommitted temp file backing the layer, if any.
+func (l *Layer) Discard() error {
+	if l.tempFileName == "" {
+		return nil
+	}
+
+	if err := os.Remove(l.tempFileName); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return nil
 }
 
 func (l *Layer) Commit() (bool, error) {
