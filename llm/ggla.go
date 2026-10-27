@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"slices"
+	"strings"
 )
 
 // gglaMaxDims matches GGML_MAX_DIMS.
@@ -135,12 +136,17 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 		// ref: https://github.com/ggerganov/llama.cpp/blob/29ae62d2ae163e2b68aa0ad3bf2ab4636de0c957/convert-lora-to-ggml.py#L44
 		slices.Reverse(t.Shape)
 
-		name := make([]byte, namesize)
-		if err := binary.Read(rs, binary.LittleEndian, &name); err != nil {
+		// grow with the bytes actually read so a bogus namesize cannot force a
+		// large allocation when the stream length is unknown
+		var name strings.Builder
+		if _, err := io.CopyN(&name, rs, int64(namesize)); err != nil {
+			if errors.Is(err, io.EOF) {
+				return io.ErrUnexpectedEOF
+			}
 			return err
 		}
 
-		t.Name = string(name)
+		t.Name = name.String()
 
 		offset, err := rs.Seek(0, io.SeekCurrent)
 		if err != nil {

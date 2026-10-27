@@ -154,6 +154,15 @@ func TestGGLADecodeWithoutSeekEnd(t *testing.T) {
 		t.Fatalf("got %d tensors, want 1", n)
 	}
 
+	nameTooLong := encodeGGLA(t)
+	nameTooLong = binary.LittleEndian.AppendUint32(nameTooLong, 1)          // dims
+	nameTooLong = binary.LittleEndian.AppendUint32(nameTooLong, 0xffffffff) // namesize
+	nameTooLong = binary.LittleEndian.AppendUint32(nameTooLong, 0)          // kind
+	nameTooLong = binary.LittleEndian.AppendUint32(nameTooLong, 1)          // shape
+	if _, _, err := decodeWithTimeout(t, noSeekEndReader{bytes.NewReader(nameTooLong)}); err == nil {
+		t.Fatal("expected error for truncated name")
+	}
+
 	loop := encodeGGLA(t, gglaTestTensor{kind: 0, shape: []uint32{4294967292, 3221225475}})
 	if _, _, err := decodeWithTimeout(t, noSeekEndReader{bytes.NewReader(loop)}); err == nil {
 		t.Fatal("expected error")
