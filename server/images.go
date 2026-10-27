@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"unicode"
 
 	"golang.org/x/exp/slices"
 
@@ -1192,8 +1194,9 @@ func makeRequestWithRetry(ctx context.Context, method string, requestURL *url.UR
 		switch {
 		case resp.StatusCode == http.StatusUnauthorized:
 			// Handle authentication error with one retry
+			resp.Body.Close()
 			challenge := parseRegistryChallenge(resp.Header.Get("www-authenticate"))
-			token, err := getAuthorizationToken(ctx, challenge)
+			token, err := getAuthorizationToken(ctx, challenge, resp.Request.URL)
 			if err != nil {
 				return nil, err
 			}
@@ -1206,13 +1209,11 @@ func makeRequestWithRetry(ctx context.Context, method string, requestURL *url.UR
 				}
 			}
 		case resp.StatusCode == http.StatusNotFound:
+			resp.Body.Close()
 			return nil, os.ErrNotExist
 		case resp.StatusCode >= http.StatusBadRequest:
-			responseBody, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return nil, fmt.Errorf("%d: %s", resp.StatusCode, err)
-			}
-			return nil, fmt.Errorf("%d: %s", resp.StatusCode, responseBody)
+			defer resp.Body.Close()
+			return nil, registryError(resp)
 		default:
 			return resp, nil
 		}
@@ -1231,7 +1232,129 @@ func makeRequestWithRetry(ctx context.Context, method string, requestURL *url.UR
 	return nil, errUnauthorized
 }
 
+// registryClient follows redirects (e.g. to blob storage) but refuses to be
+// redirected from a remote registry onto loopback, private or link-local hosts.
+var registryClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+
+		if isLocalHost(req.URL.Hostname()) && !isLocalHost(via[0].URL.Hostname()) {
+			return fmt.Errorf("refusing redirect from %s to local address %s", via[0].URL.Host, req.URL.Host)
+		}
+
+		return nil
+	},
+}
+
+func isLocalHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+const (
+	maxRegistryErrorBodySize = 64 << 10
+	maxRegistryErrorMessages = 3
+	maxRegistryErrorLength   = 256
+)
+
+func statusText(code int) string {
+	if text := http.StatusText(code); text != "" {
+		return fmt.Sprintf("%d %s", code, text)
+	}
+
+	return strconv.Itoa(code)
+}
+
+// sanitizeRegistryMessage strips control characters and bounds the length of a
+// message reported by a registry.
+func sanitizeRegistryMessage(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, strings.TrimSpace(s))
+
+	if r := []rune(s); len(r) > maxRegistryErrorLength {
+		s = string(r[:maxRegistryErrorLength]) + "..."
+	}
+
+	return s
+}
+
+// redactURL drops userinfo, query and fragment, which may carry credentials
+// such as signed blob storage parameters.
+func redactURL(u *url.URL) string {
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String()
+}
+
+func truncateForLog(body []byte) string {
+	if len(body) > 1024 {
+		body = body[:1024]
+	}
+
+	return string(body)
+}
+
+// registryError builds a client-facing error for a failed registry response.
+// Only structured registry error messages are surfaced; any other response
+// body is logged at debug level and never returned to the caller.
+func registryError(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxRegistryErrorBodySize))
+
+	var payload struct {
+		Errors []struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"errors"`
+		Error string `json:"error"`
+	}
+
+	var messages []string
+	if err := json.Unmarshal(body, &payload); err == nil {
+		for _, e := range payload.Errors {
+			if len(messages) == maxRegistryErrorMessages {
+				break
+			}
+
+			if msg := sanitizeRegistryMessage(e.Message); msg != "" {
+				messages = append(messages, msg)
+			} else if code := sanitizeRegistryMessage(e.Code); code != "" {
+				messages = append(messages, code)
+			}
+		}
+
+		if len(messages) == 0 {
+			if msg := sanitizeRegistryMessage(payload.Error); msg != "" {
+				messages = append(messages, msg)
+			}
+		}
+	}
+
+	if len(messages) == 0 {
+		slog.Debug("registry request failed", "url", redactURL(resp.Request.URL), "status", resp.StatusCode, "body", truncateForLog(body))
+		return fmt.Errorf("registry responded with %s", statusText(resp.StatusCode))
+	}
+
+	return fmt.Errorf("%d: %s", resp.StatusCode, strings.Join(messages, "; "))
+}
+
 func makeRequest(ctx context.Context, method string, requestURL *url.URL, headers http.Header, body io.Reader, regOpts *registryOptions) (*http.Response, error) {
+	return makeRequestWithClient(ctx, registryClient, method, requestURL, headers, body, regOpts)
+}
+
+func makeRequestWithClient(ctx context.Context, client *http.Client, method string, requestURL *url.URL, headers http.Header, body io.Reader, regOpts *registryOptions) (*http.Response, error) {
 	if requestURL.Scheme != "http" && regOpts != nil && regOpts.Insecure {
 		requestURL.Scheme = "http"
 	}
@@ -1264,7 +1387,7 @@ func makeRequest(ctx context.Context, method string, requestURL *url.URL, header
 		req.ContentLength = contentLength
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
