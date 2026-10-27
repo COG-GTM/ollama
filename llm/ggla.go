@@ -3,8 +3,15 @@ package llm
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
+)
+
+const (
+	// maxGGLATensorDims matches GGML_MAX_DIMS.
+	maxGGLATensorDims = 4
+	maxGGLANameSize   = 1024
 )
 
 type containerGGLA struct {
@@ -72,9 +79,17 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 			return err
 		}
 
+		if dims > maxGGLATensorDims {
+			return fmt.Errorf("ggla: tensor has %d dimensions, maximum is %d", dims, maxGGLATensorDims)
+		}
+
 		var namesize uint32
 		if err := binary.Read(rs, binary.LittleEndian, &namesize); err != nil {
 			return err
+		}
+
+		if namesize > maxGGLANameSize {
+			return fmt.Errorf("ggla: tensor name size %d exceeds maximum %d", namesize, maxGGLANameSize)
 		}
 
 		var t Tensor
@@ -97,7 +112,7 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 		slices.Reverse(t.Shape)
 
 		name := make([]byte, namesize)
-		if err := binary.Read(rs, binary.LittleEndian, &name); err != nil {
+		if _, err := io.ReadFull(rs, name); err != nil {
 			return err
 		}
 
