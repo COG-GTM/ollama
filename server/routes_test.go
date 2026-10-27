@@ -208,6 +208,27 @@ func Test_Routes(t *testing.T) {
 				assert.Equal(t, expectedParams, params)
 			},
 		},
+		{
+			Name:   "Generate Handler rejects unbounded template",
+			Method: http.MethodPost,
+			Path:   "/api/generate",
+			Setup: func(t *testing.T, req *http.Request) {
+				genReq := api.GenerateRequest{
+					Model:    "show-model",
+					Prompt:   strings.Repeat("A", 4096),
+					Template: "{{range 100000}}{{range 100000}}{{$.Prompt}}{{end}}{{end}}",
+				}
+				jsonData, err := json.Marshal(genReq)
+				assert.Nil(t, err)
+				req.Body = io.NopCloser(bytes.NewReader(jsonData))
+			},
+			Expected: func(t *testing.T, resp *http.Response) {
+				assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+				body, err := io.ReadAll(resp.Body)
+				assert.Nil(t, err)
+				assert.Contains(t, string(body), "invalid template")
+			},
+		},
 	}
 
 	s := &Server{}

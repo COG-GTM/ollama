@@ -54,7 +54,7 @@ func formatTemplateForResponse(tmpl *template.Template, generate bool) {
 // Prompt renders a prompt from a template. If generate is set to true,
 // the response and parts of the template following it are not rendered
 func Prompt(tmpl, system, prompt, response string, generate bool) (string, error) {
-	parsed, err := template.New("").Option("missingkey=zero").Parse(tmpl)
+	parsed, err := parseTemplate(tmpl)
 	if err != nil {
 		return "", err
 	}
@@ -67,12 +67,12 @@ func Prompt(tmpl, system, prompt, response string, generate bool) (string, error
 		"Response": response,
 	}
 
-	var sb strings.Builder
-	if err := parsed.Execute(&sb, vars); err != nil {
+	budget := newRenderBudget(tmpl, system, prompt, response)
+	if err := parsed.Funcs(budget.funcs()).Execute(budget, vars); err != nil {
 		return "", err
 	}
 
-	return sb.String(), nil
+	return budget.String(), nil
 }
 
 func countTokens(tmpl string, system string, prompt string, response string, encode func(string) ([]int, error)) (int, error) {

@@ -1,8 +1,10 @@
 package server
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ollama/ollama/api"
 )
@@ -199,6 +201,77 @@ func TestChatPrompt(t *testing.T) {
 
 			if got != tc.want {
 				t.Errorf("got: %q, want: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPromptLimits(t *testing.T) {
+	prompt := strings.Repeat("A", 4096)
+
+	rejected := []struct {
+		name     string
+		template string
+		prompt   string
+	}{
+		{"nested integer range", "{{range 100000}}{{range 100000}}{{$.Prompt}}{{end}}{{end}}", ""},
+		{"empty integer range", "{{range 1000000000}}{{end}}", ""},
+		{"range over variable", "{{$n := 1000000000}}{{range $n}}{{end}}", ""},
+		{"range over function", "{{range len .Prompt}}{{range len .Prompt}}x{{end}}{{end}}", ""},
+		{"nested range in else", "{{if .System}}{{else}}{{range 10}}{{end}}{{end}}", ""},
+		{"recursive template", "{{template \"\" .}}{{template \"\" .}}", ""},
+		{"define", "{{define \"a\"}}{{.Prompt}}{{end}}{{template \"a\" .}}", ""},
+		{"block", "{{block \"a\" .}}{{.Prompt}}{{end}}", ""},
+		{"oversized template", strings.Repeat("x", maxTemplateSize+1), ""},
+		{"repeated prompt", strings.Repeat("{{.Prompt}}", 4096), ""},
+		{"printf width", strings.Repeat(`{{printf "%999999d" 1}}`, 64), ""},
+		{"printf star width", strings.Repeat(`{{printf "%*d" 999999 1}}`, 64), ""},
+		{"printf large precision", `{{printf "%.9999999d" 1}}`, ""},
+		{"printf large width", `{{printf "%9999999d" 1}}`, ""},
+		{"printf width sum", "{{printf .Prompt 1}}", strings.Repeat("%9999999999d", 1<<16)},
+		{"doubling variables", `{{$a := print .Prompt .Prompt}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}{{$a = print $a $a}}`, ""},
+		{"nested escaping", `{{js (js (js (js (js (js (js (js (js (js (js (js (js (js (js (js .Prompt)))))))))))))))}}`, strings.Repeat("<", 4096)},
+	}
+
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.prompt == "" {
+				tc.prompt = prompt
+			}
+
+			start := time.Now()
+			_, err := Prompt(tc.template, "", tc.prompt, "", false)
+			if !errors.Is(err, errTemplateLimit) {
+				t.Fatalf("err = %v, want %v", err, errTemplateLimit)
+			}
+
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Fatalf("took %s to reject", elapsed)
+			}
+		})
+	}
+
+	allowed := []struct {
+		name     string
+		template string
+		want     string
+	}{
+		{"conditionals", "{{ if .System }}<<SYS>>{{ .System }}<</SYS>>{{ end }}[INST] {{ .Prompt }} [/INST]", "<<SYS>>sys<</SYS>>[INST] " + prompt + " [/INST]"},
+		{"range over field", "{{range .Messages}}x{{end}}{{.Prompt}}", prompt},
+		{"range over dot", "{{range $k, $v := .}}{{end}}{{.Prompt}}", prompt},
+		{"printf", `{{printf "%s|%5d|%.2f" .System 7 1.5}}`, "sys|    7|1.50"},
+		{"html", `{{html "<b>"}}`, "&lt;b&gt;"},
+	}
+
+	for _, tc := range allowed {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Prompt(tc.template, "sys", prompt, "", true)
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+
+			if got != tc.want {
+				t.Errorf("got = %q, want %q", got, tc.want)
 			}
 		})
 	}
