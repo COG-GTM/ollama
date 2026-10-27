@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ const maxRetries = 6
 
 var errMaxRetriesExceeded = errors.New("max retries exceeded")
 var errPartStalled = errors.New("part stalled")
+var errInvalidBlobResponse = errors.New("invalid blob response from registry")
 
 var blobDownloadManager sync.Map
 
@@ -62,6 +64,10 @@ const (
 	numDownloadParts          = 64
 	minDownloadPartSize int64 = 100 * format.MegaByte
 	maxDownloadPartSize int64 = 1000 * format.MegaByte
+
+	// maxDownloadSize bounds the blob size accepted from a registry, which
+	// also bounds the number of part files to maxDownloadSize/maxDownloadPartSize.
+	maxDownloadSize int64 = 1000 * maxDownloadPartSize
 )
 
 func (p *blobDownloadPart) Name() string {
@@ -109,7 +115,16 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 		}
 		defer resp.Body.Close()
 
-		b.Total, _ = strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+		contentLength := resp.Header.Get("Content-Length")
+		total, err := strconv.ParseInt(contentLength, 10, 64)
+		switch {
+		case err != nil, total <= 0:
+			return fmt.Errorf("%w: invalid Content-Length %q", errInvalidBlobResponse, contentLength)
+		case total > maxDownloadSize:
+			return fmt.Errorf("%w: Content-Length %d exceeds maximum blob size %d", errInvalidBlobResponse, total, maxDownloadSize)
+		}
+
+		b.Total = total
 
 		size := b.Total / numDownloadParts
 		switch {
@@ -133,11 +148,22 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 		}
 	}
 
+	if len(b.Parts) == 0 {
+		return fmt.Errorf("%w: no parts to download for %s", errInvalidBlobResponse, b.Digest)
+	}
+
 	slog.Info(fmt.Sprintf("downloading %s in %d %s part(s)", b.Digest[7:19], len(b.Parts), format.HumanBytes(b.Parts[0].Size)))
 	return nil
 }
 
 func (b *blobDownload) Run(ctx context.Context, requestURL *url.URL, opts *registryOptions) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("blob download panicked", "digest", b.Digest, "panic", r, "stack", string(debug.Stack()))
+			b.err = fmt.Errorf("download %s: internal error: %v", b.Digest, r)
+		}
+	}()
+
 	b.err = b.run(ctx, requestURL, opts)
 }
 
@@ -221,7 +247,14 @@ func (b *blobDownload) downloadChunk(ctx context.Context, requestURL *url.URL, w
 		}
 		defer resp.Body.Close()
 
-		n, err := io.Copy(w, io.TeeReader(resp.Body, part))
+		// a 200 means the registry ignored the Range header, so the body does
+		// not start at this part's offset
+		if resp.StatusCode != http.StatusPartialContent && part.StartsAt() != 0 {
+			return fmt.Errorf("%w: expected %d for range request, got %d", errInvalidBlobResponse, http.StatusPartialContent, resp.StatusCode)
+		}
+
+		remaining := part.StopsAt() - part.StartsAt()
+		n, err := io.Copy(w, io.TeeReader(io.LimitReader(resp.Body, remaining), part))
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			// rollback progress
 			b.Completed.Add(-n)
@@ -341,6 +374,10 @@ type downloadOpts struct {
 
 // downloadBlob downloads a blob from the registry and stores it in the blobs directory
 func downloadBlob(ctx context.Context, opts downloadOpts) error {
+	if err := validateDigest(opts.digest); err != nil {
+		return err
+	}
+
 	fp, err := GetBlobsPath(opts.digest)
 	if err != nil {
 		return err

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -447,6 +448,13 @@ func (s *Server) PullModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("pull model panicked", "model", model, "panic", r, "stack", string(debug.Stack()))
+				ch <- gin.H{"error": fmt.Sprintf("pull model: internal error: %v", r)}
+			}
+		}()
+
 		fn := func(r api.ProgressResponse) {
 			ch <- r
 		}
@@ -496,6 +504,13 @@ func (s *Server) PushModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("push model panicked", "model", model, "panic", r, "stack", string(debug.Stack()))
+				ch <- gin.H{"error": fmt.Sprintf("push model: internal error: %v", r)}
+			}
+		}()
+
 		fn := func(r api.ProgressResponse) {
 			ch <- r
 		}
