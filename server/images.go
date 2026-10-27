@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1044,6 +1045,10 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return fmt.Errorf("pull model manifest: %s", err)
 	}
 
+	if err := validateManifest(manifest); err != nil {
+		return fmt.Errorf("pull model manifest: %w", err)
+	}
+
 	var layers []*Layer
 	layers = append(layers, manifest.Layers...)
 	layers = append(layers, manifest.Config)
@@ -1126,12 +1131,64 @@ func pullModelManifest(ctx context.Context, mp ModelPath, regOpts *registryOptio
 	}
 	defer resp.Body.Close()
 
-	var m *ManifestV2
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize+1))
+	if err != nil {
 		return nil, err
 	}
 
-	return m, err
+	if int64(len(body)) > maxManifestSize {
+		return nil, fmt.Errorf("%w: manifest exceeds %d bytes", errInvalidManifest, maxManifestSize)
+	}
+
+	var m *ManifestV2
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+
+	return m, nil
+}
+
+const maxManifestSize = 4 * format.MegaByte
+
+var (
+	errInvalidManifest = errors.New("invalid manifest")
+	errInvalidDigest   = errors.New("invalid digest")
+
+	digestRegexp = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+)
+
+func validateDigest(digest string) error {
+	if !digestRegexp.MatchString(digest) {
+		return fmt.Errorf("%w: %q", errInvalidDigest, digest)
+	}
+
+	return nil
+}
+
+func validateManifest(m *ManifestV2) error {
+	if m == nil {
+		return fmt.Errorf("%w: empty manifest", errInvalidManifest)
+	}
+
+	if m.Config == nil {
+		return fmt.Errorf("%w: missing config", errInvalidManifest)
+	}
+
+	if len(m.Layers) == 0 {
+		return fmt.Errorf("%w: no layers", errInvalidManifest)
+	}
+
+	for _, layer := range append([]*Layer{m.Config}, m.Layers...) {
+		if layer == nil {
+			return fmt.Errorf("%w: null layer", errInvalidManifest)
+		}
+
+		if err := validateDigest(layer.Digest); err != nil {
+			return fmt.Errorf("%w: %w", errInvalidManifest, err)
+		}
+	}
+
+	return nil
 }
 
 // GetSHA256Digest returns the SHA256 hash of a given buffer and returns it, and the size of buffer
@@ -1280,6 +1337,10 @@ func getValue(header, key string) string {
 
 	// Move the index to the starting quote after the key.
 	startIdx += len(key) + 2
+	if startIdx >= len(header) {
+		return ""
+	}
+
 	endIdx := startIdx
 
 	for endIdx < len(header) {
