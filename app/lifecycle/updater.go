@@ -3,12 +3,13 @@ package lifecycle
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -103,33 +104,70 @@ func IsNewReleaseAvailable(ctx context.Context) (bool, UpdateResponse) {
 	return true, updateResp
 }
 
+var updateHTTPClient = &http.Client{CheckRedirect: requireHTTPSRedirect}
+
+func requireHTTPSRedirect(req *http.Request, via []*http.Request) error {
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing non-https update redirect to %s", req.URL.Redacted())
+	}
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
+}
+
+// stageInstallerPath returns where the installer for etag (or downloadURL when
+// the server sends no etag) is staged. Both come from the network, so the key is
+// hashed instead of being used as a path component, and the file name is always
+// Installer.
+func stageInstallerPath(etag, downloadURL string) (string, error) {
+	key := "etag:" + etag
+	if etag == "" {
+		key = "url:" + downloadURL
+	}
+	sum := sha256.Sum256([]byte(key))
+	dir := hex.EncodeToString(sum[:])
+
+	stageFilename := filepath.Join(UpdateStageDir, dir, Installer)
+	rel, err := filepath.Rel(UpdateStageDir, stageFilename)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("update stage path %s is outside %s", stageFilename, UpdateStageDir)
+	}
+	return stageFilename, nil
+}
+
 func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
+	downloadURL, err := url.Parse(updateResp.UpdateURL)
+	if err != nil {
+		return fmt.Errorf("invalid update url: %w", err)
+	}
+	if downloadURL.Scheme != "https" {
+		return fmt.Errorf("refusing non-https update url %s", downloadURL.Redacted())
+	}
+
 	// Do a head first to check etag info
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, updateResp.UpdateURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, downloadURL.String(), nil)
 	if err != nil {
 		return err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := updateHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("error checking update: %w", err)
 	}
+	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("unexpected status attempting to download update %d", resp.StatusCode)
 	}
-	resp.Body.Close()
 	etag := strings.Trim(resp.Header.Get("etag"), "\"")
 	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup")
-		etag = "_"
-	}
-	filename := Installer
-	_, params, err := mime.ParseMediaType(resp.Header.Get("content-disposition"))
-	if err == nil {
-		filename = params["filename"]
+		slog.Debug("no etag detected, falling back to url based dedup")
 	}
 
-	stageFilename := filepath.Join(UpdateStageDir, etag, filename)
+	stageFilename, err := stageInstallerPath(etag, downloadURL.String())
+	if err != nil {
+		return err
+	}
 
 	// Check to see if we already have it downloaded
 	_, err = os.Stat(stageFilename)
@@ -141,24 +179,20 @@ func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
 	cleanupOldDownloads()
 
 	req.Method = http.MethodGet
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = updateHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("error checking update: %w", err)
 	}
 	defer resp.Body.Close()
-	etag = strings.Trim(resp.Header.Get("etag"), "\"")
-	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup") // TODO probably can get rid of this redundant log
-		etag = "_"
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("unexpected status attempting to download update %d", resp.StatusCode)
+	}
+	if getEtag := strings.Trim(resp.Header.Get("etag"), "\""); getEtag != etag {
+		slog.Warn("update etag changed between HEAD and GET, staging under the HEAD etag")
 	}
 
-	stageFilename = filepath.Join(UpdateStageDir, etag, filename)
-
-	_, err = os.Stat(filepath.Dir(stageFilename))
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(filepath.Dir(stageFilename), 0o755); err != nil {
-			return fmt.Errorf("create ollama dir %s: %v", filepath.Dir(stageFilename), err)
-		}
+	if err := os.MkdirAll(filepath.Dir(stageFilename), 0o755); err != nil {
+		return fmt.Errorf("create ollama dir %s: %v", filepath.Dir(stageFilename), err)
 	}
 
 	payload, err := io.ReadAll(resp.Body)
