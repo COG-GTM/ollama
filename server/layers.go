@@ -17,18 +17,23 @@ type Layers struct {
 func (ls *Layers) Add(layer *Layer) {
 	if layer.Size > 0 {
 		ls.items = append(ls.items, layer)
+	} else {
+		layer.discard()
 	}
 }
 
 func (ls *Layers) Replace(layer *Layer) {
-	if layer.Size > 0 {
-		mediatype := layer.MediaType
-		layers := slices.DeleteFunc(ls.items, func(l *Layer) bool {
-			return l.MediaType == mediatype
-		})
-
-		ls.items = append(layers, layer)
+	if layer.Size <= 0 {
+		layer.discard()
+		return
 	}
+
+	mediatype := layer.MediaType
+	layers := slices.DeleteFunc(ls.items, func(l *Layer) bool {
+		return l.MediaType == mediatype
+	})
+
+	ls.items = append(layers, layer)
 }
 
 type Layer struct {
@@ -58,6 +63,7 @@ func NewLayer(r io.Reader, mediatype string) (*Layer, error) {
 	sha256sum := sha256.New()
 	n, err := io.Copy(io.MultiWriter(temp, sha256sum), r)
 	if err != nil {
+		os.Remove(temp.Name())
 		return nil, err
 	}
 
@@ -86,6 +92,13 @@ func NewLayerFromLayer(digest, mediatype, from string) (*Layer, error) {
 		Size:      fi.Size(),
 		From:      from,
 	}, nil
+}
+
+// discard removes the layer's uncommitted temp file, if any.
+func (l *Layer) discard() {
+	if l.tempFileName != "" {
+		os.Remove(l.tempFileName)
+	}
 }
 
 func (l *Layer) Commit() (bool, error) {

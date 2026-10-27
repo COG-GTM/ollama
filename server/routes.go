@@ -573,15 +573,23 @@ func (s *Server) CreateModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
-		fn := func(resp api.ProgressResponse) {
-			ch <- resp
-		}
 
 		ctx, cancel := context.WithCancel(c.Request.Context())
 		defer cancel()
 
+		send := func(v any) {
+			select {
+			case ch <- v:
+			case <-ctx.Done():
+			}
+		}
+
+		fn := func(resp api.ProgressResponse) {
+			send(resp)
+		}
+
 		if err := CreateModel(ctx, model, filepath.Dir(req.Path), req.Quantization, commands, fn); err != nil {
-			ch <- gin.H{"error": err.Error()}
+			send(gin.H{"error": err.Error()})
 		}
 	}()
 

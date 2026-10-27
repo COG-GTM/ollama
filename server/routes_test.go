@@ -10,13 +10,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/version"
 )
@@ -240,4 +243,42 @@ func Test_Routes(t *testing.T) {
 		}
 
 	}
+}
+
+func TestCreateModelRejectsOverflowingTensorSize(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	f, err := os.CreateTemp(t.TempDir(), "ollama-model")
+	assert.Nil(t, err)
+
+	// GGUF v3 with one F32 tensor whose size (4*shape) wraps to -64, which
+	// previously seeked back to byte 0 and made CreateModel loop forever
+	var b bytes.Buffer
+	for _, v := range []any{
+		[]byte("GGUF"), uint32(3), uint64(1), uint64(0),
+		uint64(1), []byte("a"), uint32(1), uint64(1<<62 - 16), uint32(0), uint64(0),
+	} {
+		assert.Nil(t, binary.Write(&b, binary.LittleEndian, v))
+	}
+	for b.Len()%32 != 0 {
+		b.WriteByte(0)
+	}
+	_, err = f.Write(b.Bytes())
+	assert.Nil(t, err)
+	assert.Nil(t, f.Close())
+
+	commands, err := parser.Parse(strings.NewReader("FROM " + f.Name()))
+	assert.Nil(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = CreateModel(ctx, "overflow", "", "", commands, func(api.ProgressResponse) {})
+	assert.ErrorIs(t, err, llm.ErrInvalidTensor)
+
+	blobs, err := GetBlobsPath("")
+	assert.Nil(t, err)
+	partial, err := filepath.Glob(filepath.Join(blobs, "*-partial"))
+	assert.Nil(t, err)
+	assert.Empty(t, partial)
 }

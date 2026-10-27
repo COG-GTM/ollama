@@ -445,12 +445,16 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 
 			var offset int64
 			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+
 				fn(api.ProgressResponse{Status: "creating model layer"})
 				if _, err := bin.Seek(offset, io.SeekStart); err != nil {
 					return err
 				}
 
-				ggml, size, err := llm.DecodeGGML(bin)
+				ggml, end, err := llm.DecodeGGML(bin)
 				if errors.Is(err, io.EOF) {
 					break
 				} else if errors.Is(err, llm.ErrUnsupportedFormat) {
@@ -458,6 +462,13 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 				} else if err != nil {
 					return err
 				}
+
+				// DecodeGGML returns the absolute position after the model
+				if end <= offset {
+					return fmt.Errorf("model binary specified in FROM field is not a valid gguf format model: decoder did not advance past offset %d", offset)
+				}
+
+				size := end - offset
 
 				config.SetModelFormat(ggml.Name())
 				config.SetModelFamily(ggml.KV().Architecture())
