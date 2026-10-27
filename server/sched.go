@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"reflect"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -119,100 +120,119 @@ func (s *Scheduler) processPending(ctx context.Context) {
 			slog.Debug("shutting down scheduler pending loop")
 			return
 		case pending := <-s.pendingReqCh:
-			// Block other requests until we get this pending request running
-			for {
-				var runnerToExpire *runnerRef
-				s.loadedMu.Lock()
-				runner := s.loaded[pending.model.ModelPath]
-				loadedCount := len(s.loaded)
-				s.loadedMu.Unlock()
-				if runner != nil {
-					if runner.needsReload(ctx, pending) {
-						runnerToExpire = runner
-					} else {
-						// Runner is usable, return it
-						pending.useLoadedRunner(runner, s.finishedReqCh)
-						break
-					}
-				} else if loadedMax > 0 && loadedCount >= loadedMax {
-					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
-					runnerToExpire = s.findRunnerToUnload(pending)
-				} else {
-					// Either no models are loaded or below loadedMax
-					// Get a refreshed GPU list
-					gpus := s.getGpuFn()
-
-					// Load model for fitting
-					ggml, err := llm.LoadModel(pending.model.ModelPath)
-					if err != nil {
-						pending.errCh <- err
-						break
-					}
-
-					// If we're CPU only mode, just limit by loadedMax above
-					// TODO handle system memory exhaustion
-					if (len(gpus) == 1 && gpus[0].Library == "cpu") || pending.opts.NumGPU == 0 {
-						slog.Debug("cpu mode with existing models, loading")
-						s.loadFn(pending, ggml, gpus)
-						break
-					}
-
-					// No models loaded. Load the model but prefer the best fit.
-					if loadedCount == 0 {
-						slog.Debug("loading first model", "model", pending.model.ModelPath)
-						g := pickBestFitGPUs(pending, ggml, gpus)
-						if g != nil {
-							gpus = g
-						}
-						s.loadFn(pending, ggml, gpus)
-						break
-					}
-
-					// More than one loaded model, so we have to see if the new one fits
-					// Update free memory from currently loaded models
-					s.updateFreeSpace(gpus)
-					gpus = pickBestFitGPUs(pending, ggml, gpus)
-					if gpus != nil {
-						slog.Debug("new model fits with existing models, loading")
-						s.loadFn(pending, ggml, gpus)
-						break
-					}
-					runnerToExpire = s.findRunnerToUnload(pending)
-				}
-
-				if runnerToExpire == nil {
-					// Shouildn't happen
-					slog.Error("runner to expire was nil!")
-					continue
-				}
-				// Trigger an expiration to unload once it's done
-				runnerToExpire.refMu.Lock()
-				slog.Debug("resetting model to expire immediately to make room", "model", runnerToExpire.model, "refCount", runnerToExpire.refCount)
-				if runnerToExpire.expireTimer != nil {
-					runnerToExpire.expireTimer.Stop()
-					runnerToExpire.expireTimer = nil
-				}
-				runnerToExpire.sessionDuration = 0
-				if runnerToExpire.refCount <= 0 {
-					s.expiredCh <- runnerToExpire
-				}
-				runnerToExpire.refMu.Unlock()
-				// Wait for the unload to happen
-				// Note: at this point we're queueing up all incoming requests, even if they were for
-				// a different model that's loaded and not scheduled to be removed.
-				slog.Debug("waiting for pending requests to complete and unload to occur", "model", runnerToExpire.model)
-				select {
-				case <-ctx.Done():
-					slog.Debug("shutting down scheduler pending loop")
-					return
-				case <-s.unloadedCh:
-					slog.Debug("unload completed", "model", runnerToExpire.model)
-					continue
-				}
+			if s.processPendingRequest(ctx, pending) {
+				return
 			}
 		case <-s.unloadedCh:
 			// An unload request when there are no pending request can be ignored
 			slog.Debug("ignoring unload event with no pending requests")
+		}
+	}
+}
+
+// processPendingRequest schedules a single pending request and reports whether
+// the scheduler is shutting down. A panic while inspecting or loading the model
+// is returned to the requester instead of crashing the server.
+func (s *Scheduler) processPendingRequest(ctx context.Context, pending *LlmRequest) (shutdown bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic while scheduling model", "model", pending.model.ModelPath, "error", r, "stack", string(debug.Stack()))
+			select {
+			case pending.errCh <- fmt.Errorf("failed to load model %s: %v", pending.model.ShortName, r):
+			default:
+			}
+		}
+	}()
+
+	// Block other requests until we get this pending request running
+	for {
+		var runnerToExpire *runnerRef
+		s.loadedMu.Lock()
+		runner := s.loaded[pending.model.ModelPath]
+		loadedCount := len(s.loaded)
+		s.loadedMu.Unlock()
+		if runner != nil {
+			if runner.needsReload(ctx, pending) {
+				runnerToExpire = runner
+			} else {
+				// Runner is usable, return it
+				pending.useLoadedRunner(runner, s.finishedReqCh)
+				break
+			}
+		} else if loadedMax > 0 && loadedCount >= loadedMax {
+			slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
+			runnerToExpire = s.findRunnerToUnload(pending)
+		} else {
+			// Either no models are loaded or below loadedMax
+			// Get a refreshed GPU list
+			gpus := s.getGpuFn()
+
+			// Load model for fitting
+			ggml, err := llm.LoadModel(pending.model.ModelPath)
+			if err != nil {
+				pending.errCh <- err
+				break
+			}
+
+			// If we're CPU only mode, just limit by loadedMax above
+			// TODO handle system memory exhaustion
+			if (len(gpus) == 1 && gpus[0].Library == "cpu") || pending.opts.NumGPU == 0 {
+				slog.Debug("cpu mode with existing models, loading")
+				s.loadFn(pending, ggml, gpus)
+				break
+			}
+
+			// No models loaded. Load the model but prefer the best fit.
+			if loadedCount == 0 {
+				slog.Debug("loading first model", "model", pending.model.ModelPath)
+				g := pickBestFitGPUs(pending, ggml, gpus)
+				if g != nil {
+					gpus = g
+				}
+				s.loadFn(pending, ggml, gpus)
+				break
+			}
+
+			// More than one loaded model, so we have to see if the new one fits
+			// Update free memory from currently loaded models
+			s.updateFreeSpace(gpus)
+			gpus = pickBestFitGPUs(pending, ggml, gpus)
+			if gpus != nil {
+				slog.Debug("new model fits with existing models, loading")
+				s.loadFn(pending, ggml, gpus)
+				break
+			}
+			runnerToExpire = s.findRunnerToUnload(pending)
+		}
+
+		if runnerToExpire == nil {
+			// Shouildn't happen
+			slog.Error("runner to expire was nil!")
+			continue
+		}
+		// Trigger an expiration to unload once it's done
+		runnerToExpire.refMu.Lock()
+		slog.Debug("resetting model to expire immediately to make room", "model", runnerToExpire.model, "refCount", runnerToExpire.refCount)
+		if runnerToExpire.expireTimer != nil {
+			runnerToExpire.expireTimer.Stop()
+			runnerToExpire.expireTimer = nil
+		}
+		runnerToExpire.sessionDuration = 0
+		if runnerToExpire.refCount <= 0 {
+			s.expiredCh <- runnerToExpire
+		}
+		runnerToExpire.refMu.Unlock()
+		// Wait for the unload to happen
+		// Note: at this point we're queueing up all incoming requests, even if they were for
+		// a different model that's loaded and not scheduled to be removed.
+		slog.Debug("waiting for pending requests to complete and unload to occur", "model", runnerToExpire.model)
+		select {
+		case <-ctx.Done():
+			slog.Debug("shutting down scheduler pending loop")
+			return true
+		case <-s.unloadedCh:
+			slog.Debug("unload completed", "model", runnerToExpire.model)
+			continue
 		}
 	}
 }
