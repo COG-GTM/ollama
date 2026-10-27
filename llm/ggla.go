@@ -3,9 +3,13 @@ package llm
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 )
+
+// gglaMaxDims matches GGML_MAX_DIMS.
+const gglaMaxDims = 4
 
 type containerGGLA struct {
 	version uint32
@@ -54,6 +58,20 @@ func (llm *ggla) Tensors() Tensors {
 }
 
 func (llm *ggla) decode(rs io.ReadSeeker) error {
+	start, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	end, err := rs.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+
+	if _, err := rs.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
+
 	var r uint32
 	if err := binary.Read(rs, binary.LittleEndian, &r); err != nil {
 		return err
@@ -66,15 +84,34 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 	}
 	llm.kv["alpha"] = alpha
 
+	last := int64(-1)
 	for {
+		pos, err := rs.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+
+		if pos <= last {
+			return fmt.Errorf("ggla: tensor entry at offset %d does not advance past %d", pos, last)
+		}
+		last = pos
+
 		var dims uint32
 		if err := binary.Read(rs, binary.LittleEndian, &dims); err != nil {
 			return err
 		}
 
+		if dims > gglaMaxDims {
+			return fmt.Errorf("ggla: tensor has %d dimensions, max %d", dims, gglaMaxDims)
+		}
+
 		var namesize uint32
 		if err := binary.Read(rs, binary.LittleEndian, &namesize); err != nil {
 			return err
+		}
+
+		if int64(namesize) > end-pos {
+			return fmt.Errorf("ggla: tensor name size %d exceeds file size", namesize)
 		}
 
 		var t Tensor
@@ -119,7 +156,12 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 
 		t.Offset = uint64(offset)
 
-		if _, err := rs.Seek(int64(t.size()), io.SeekCurrent); err != nil {
+		size, ok := t.checkedSize()
+		if !ok || offset > end || size > uint64(end-offset) {
+			return fmt.Errorf("ggla: tensor %q data exceeds file size", t.Name)
+		}
+
+		if _, err := rs.Seek(int64(size), io.SeekCurrent); err != nil {
 			return err
 		}
 
