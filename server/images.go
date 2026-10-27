@@ -269,8 +269,8 @@ var (
 )
 
 // blobPath resolves a FROM or ADAPTER argument that refers to a blob already
-// stored on the server, either "@sha256:<digest>" or the absolute blob path
-// printed by `ollama show --modelfile`. Arbitrary server paths are never
+// stored on the server, either "@sha256:<digest>" or the blob path printed by
+// `ollama show --modelfile`. Arbitrary server paths are never
 // resolved: Modelfiles arrive over the API and must not probe the filesystem.
 func blobPath(arg string) (string, bool, error) {
 	if digest, ok := strings.CutPrefix(arg, "@"); ok {
@@ -285,17 +285,24 @@ func blobPath(arg string) (string, bool, error) {
 		return p, true, nil
 	}
 
-	if !filepath.IsAbs(arg) {
-		return "", false, nil
-	}
-
 	blobs, err := GetBlobsPath("")
 	if err != nil {
 		return "", false, err
 	}
 
-	dir, digest := filepath.Split(filepath.Clean(arg))
-	if filepath.Clean(dir) != filepath.Clean(blobs) {
+	// OLLAMA_MODELS may be relative, so compare both sides as absolute paths.
+	absArg, err := filepath.Abs(arg)
+	if err != nil {
+		return "", false, nil
+	}
+
+	absBlobs, err := filepath.Abs(blobs)
+	if err != nil {
+		return "", false, err
+	}
+
+	dir, digest := filepath.Split(absArg)
+	if filepath.Clean(dir) != absBlobs {
 		return "", false, nil
 	}
 

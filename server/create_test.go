@@ -180,6 +180,31 @@ func TestBlobPath(t *testing.T) {
 	}
 }
 
+func TestBlobPathRelativeModelsDir(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(wd) })
+
+	t.Setenv("OLLAMA_MODELS", "models")
+
+	blob := filepath.Join("models", "blobs", "sha256-"+strings.Repeat("b", 64))
+	for _, arg := range []string{blob, "./" + blob} {
+		got, isBlob, err := blobPath(arg)
+		if err != nil || !isBlob || got != blob {
+			t.Errorf("blobPath(%q) = %q, %v, %v; want %q, true, nil", arg, got, isBlob, err, blob)
+		}
+	}
+
+	if _, isBlob, err := blobPath(filepath.Join("models", "manifests", "x")); err != nil || isBlob {
+		t.Errorf("blobPath outside blobs dir: isBlob=%v err=%v", isBlob, err)
+	}
+}
+
 func TestModelPathValidateRejectsTraversal(t *testing.T) {
 	for _, name := range []string{"/etc/passwd", "../../etc:passwd", "a/../b", "./x", "a//b", `a\b`} {
 		if err := ParseModelPath(name).Validate(); err == nil {
