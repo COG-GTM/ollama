@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -621,7 +623,9 @@ func TestRequestDuringUnload(t *testing.T) {
 
 	// Queue a request for the same model while the unload is in progress
 	s.pendingReqCh <- scenario.req
-	time.Sleep(20 * time.Millisecond)
+	// Make sure the request found the old runner and is waiting on it before
+	// the unload finishes
+	waitForGoroutineIn(t, ctx, "(*runnerRef).needsReload")
 	close(oldLlm.closeRelease)
 
 	select {
@@ -725,3 +729,19 @@ func (s *mockLlm) Close() error {
 	return s.closeResp
 }
 func (s *mockLlm) EstimatedVRAM() uint64 { return s.estimatedVRAM }
+
+// waitForGoroutineIn waits until some goroutine's stack includes fn.
+func waitForGoroutineIn(t *testing.T, ctx context.Context, fn string) {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	for {
+		if strings.Contains(string(buf[:runtime.Stack(buf, true)]), fn) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timeout waiting for a goroutine in %s", fn)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
