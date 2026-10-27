@@ -204,6 +204,10 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 		}
 
 		shape := [4]uint64{1, 1, 1, 1}
+		if dims > uint32(len(shape)) {
+			return fmt.Errorf("%w: %q has %d dimensions", ErrInvalidTensor, name, dims)
+		}
+
 		for i := 0; uint32(i) < dims; i++ {
 			shape[i], err = readGGUF[uint64](llm, rs)
 			if err != nil {
@@ -228,8 +232,17 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 			Shape:  shape[:],
 		}
 
+		parameters, err := tensor.checkedParameters()
+		if err != nil {
+			return err
+		}
+
+		if _, err := tensor.checkedSize(); err != nil {
+			return err
+		}
+
 		llm.tensors = append(llm.tensors, &tensor)
-		llm.parameters += tensor.parameters()
+		llm.parameters += parameters
 	}
 
 	// patch KV with parameter count
@@ -238,6 +251,8 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 	alignment, ok := llm.kv["general.alignment"].(uint32)
 	if !ok {
 		alignment = 32
+	} else if alignment == 0 {
+		return fmt.Errorf("%w: general.alignment must be non-zero", ErrInvalidTensor)
 	}
 
 	offset, err := rs.Seek(0, io.SeekCurrent)
@@ -250,12 +265,22 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 		return err
 	}
 
+	end, err := seekEnd(rs)
+	if err != nil {
+		return err
+	}
+
 	for _, tensor := range llm.tensors {
-		if _, err := rs.Seek(int64(tensor.size()), io.SeekCurrent); err != nil {
+		size, err := tensor.checkedSize()
+		if err != nil {
 			return err
 		}
 
-		padding := llm.padding(int64(tensor.size()), int64(alignment))
+		if err := skipTensorData(rs, size, end); err != nil {
+			return err
+		}
+
+		padding := llm.padding(size, int64(alignment))
 		if _, err := rs.Seek(padding, io.SeekCurrent); err != nil {
 			return err
 		}

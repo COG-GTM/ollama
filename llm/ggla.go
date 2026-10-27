@@ -66,6 +66,11 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 	}
 	llm.kv["alpha"] = alpha
 
+	end, err := seekEnd(rs)
+	if err != nil {
+		return err
+	}
+
 	for {
 		var dims uint32
 		if err := binary.Read(rs, binary.LittleEndian, &dims); err != nil {
@@ -119,7 +124,12 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 
 		t.Offset = uint64(offset)
 
-		if _, err := rs.Seek(int64(t.size()), io.SeekCurrent); err != nil {
+		size, err := t.checkedSize()
+		if err != nil {
+			return err
+		}
+
+		if err := skipTensorData(rs, size, end); err != nil {
 			return err
 		}
 

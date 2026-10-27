@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"strings"
 )
 
@@ -263,6 +265,78 @@ func (t Tensor) parameters() uint64 {
 
 func (t Tensor) size() uint64 {
 	return t.parameters() * t.typeSize() / t.blockSize()
+}
+
+var ErrInvalidTensor = errors.New("invalid tensor")
+
+// checkedParameters is parameters() with overflow detection for shapes read
+// from untrusted model files.
+func (t Tensor) checkedParameters() (uint64, error) {
+	var count uint64 = 1
+	for _, n := range t.Shape {
+		hi, lo := bits.Mul64(count, n)
+		if hi != 0 {
+			return 0, fmt.Errorf("%w: %q shape %v overflows", ErrInvalidTensor, t.Name, t.Shape)
+		}
+		count = lo
+	}
+	return count, nil
+}
+
+// checkedSize is size() with overflow detection. The result always fits in
+// an int64 so it can be used as a forward seek.
+func (t Tensor) checkedSize() (int64, error) {
+	params, err := t.checkedParameters()
+	if err != nil {
+		return 0, err
+	}
+
+	hi, lo := bits.Mul64(params, t.typeSize())
+	if hi != 0 {
+		return 0, fmt.Errorf("%w: %q size overflows", ErrInvalidTensor, t.Name)
+	}
+
+	size := lo / t.blockSize()
+	if size > math.MaxInt64 {
+		return 0, fmt.Errorf("%w: %q size overflows", ErrInvalidTensor, t.Name)
+	}
+
+	return int64(size), nil
+}
+
+// skipTensorData seeks forward over n bytes of tensor data, failing if the
+// data would extend past end.
+func skipTensorData(rs io.Seeker, n, end int64) error {
+	offset, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	if n < 0 || n > end-offset {
+		return fmt.Errorf("%w: tensor data extends past end of file", ErrInvalidTensor)
+	}
+
+	_, err = rs.Seek(n, io.SeekCurrent)
+	return err
+}
+
+// seekEnd returns the size of rs without moving its current position.
+func seekEnd(rs io.Seeker) (int64, error) {
+	offset, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+
+	end, err := rs.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := rs.Seek(offset, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	return end, nil
 }
 
 type container interface {
