@@ -178,23 +178,35 @@ func TestDownloadNewReleaseRejectsDigestMismatch(t *testing.T) {
 	}
 }
 
-func TestDownloadNewReleaseRejectsUnsafeNames(t *testing.T) {
-	for name, set := range map[string]func(h http.Header){
-		"filename": func(h http.Header) { h.Set("Content-Disposition", `attachment; filename="../../evil.exe"`) },
-		"etag":     func(h http.Header) { h.Set("ETag", `"..\\..\\evil"`) },
-	} {
-		t.Run(name, func(t *testing.T) {
-			s := newUpdateServer(t, []byte("installer"))
-			set(s.header)
-			err := DownloadNewRelease(context.Background(), UpdateResponse{UpdateURL: s.url()})
-			if err == nil || !strings.Contains(err.Error(), "invalid update file name") {
-				t.Fatalf("expected invalid name error, got %v", err)
-			}
-			parent := filepath.Dir(UpdateStageDir)
-			if _, err := os.Stat(filepath.Join(parent, "evil.exe")); err == nil {
-				t.Fatal("installer written outside the stage directory")
-			}
-		})
+func TestDownloadNewReleaseRejectsUnsafeFilename(t *testing.T) {
+	s := newUpdateServer(t, []byte("installer"))
+	s.header.Set("Content-Disposition", `attachment; filename="../../evil.exe"`)
+	err := DownloadNewRelease(context.Background(), UpdateResponse{UpdateURL: s.url()})
+	if err == nil || !strings.Contains(err.Error(), "invalid update file name") {
+		t.Fatalf("expected invalid name error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(UpdateStageDir), "evil.exe")); err == nil {
+		t.Fatal("installer written outside the stage directory")
+	}
+}
+
+func TestStageDirName(t *testing.T) {
+	if got := stageDirName(""); got != "_" {
+		t.Errorf("empty etag: got %q", got)
+	}
+	seen := map[string]string{}
+	for _, etag := range []string{`"abc123"`, `W/"abc123"`, `"../../evil"`, `"..\\..\\evil"`, `"C:evil"`} {
+		got := stageDirName(etag)
+		if _, err := stagePathComponent(got); err != nil {
+			t.Errorf("%q: unsafe stage dir %q: %v", etag, got, err)
+		}
+		if prev, ok := seen[got]; ok {
+			t.Errorf("%q and %q map to the same stage dir", etag, prev)
+		}
+		seen[got] = etag
+	}
+	if stageDirName(`"abc"`) != stageDirName(`"abc"`) {
+		t.Error("stage dir is not stable")
 	}
 }
 
@@ -202,18 +214,23 @@ func TestDownloadNewReleaseStagesVerifiedPayload(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test payload is not Authenticode signed")
 	}
-	payload := []byte("installer")
-	s := newUpdateServer(t, payload)
+	for _, etag := range []string{`"abc123"`, `W/"abc123"`, `"../../evil"`, ""} {
+		t.Run(etag, func(t *testing.T) {
+			payload := []byte("installer")
+			s := newUpdateServer(t, payload)
+			s.header.Set("ETag", etag)
 
-	if err := DownloadNewRelease(context.Background(), UpdateResponse{UpdateURL: s.url(), UpdateSHA256: digest(payload)}); err != nil {
-		t.Fatal(err)
-	}
-	files := stagedInstallers(t)
-	if len(files) != 1 || filepath.Base(files[0]) != Installer {
-		t.Fatalf("unexpected staged files %v", files)
-	}
-	if !UpdateDownloaded {
-		t.Fatal("UpdateDownloaded not set")
+			if err := DownloadNewRelease(context.Background(), UpdateResponse{UpdateURL: s.url(), UpdateSHA256: digest(payload)}); err != nil {
+				t.Fatal(err)
+			}
+			files := stagedInstallers(t)
+			if len(files) != 1 || filepath.Base(files[0]) != Installer || filepath.Dir(filepath.Dir(files[0])) != UpdateStageDir {
+				t.Fatalf("unexpected staged files %v", files)
+			}
+			if !UpdateDownloaded {
+				t.Fatal("UpdateDownloaded not set")
+			}
+		})
 	}
 }
 

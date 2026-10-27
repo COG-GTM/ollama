@@ -70,8 +70,20 @@ func parseUpdateURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// stagePathComponent rejects server supplied etags and filenames that are
-// not a single, plain path element.
+// stageDirName maps the server supplied ETag (which may be weak, W/"...",
+// or contain any other characters) to a fixed, path-safe directory name.
+func stageDirName(etag string) string {
+	etag = strings.TrimSpace(etag)
+	if etag == "" {
+		slog.Debug("no etag detected, falling back to filename based dedup")
+		return "_"
+	}
+	sum := sha256.Sum256([]byte(etag))
+	return hex.EncodeToString(sum[:16])
+}
+
+// stagePathComponent rejects server supplied filenames that are not a
+// single, plain path element.
 func stagePathComponent(name string) (string, error) {
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\:`) || name != filepath.Base(name) {
 		return "", fmt.Errorf("invalid update file name %q", name)
@@ -187,14 +199,7 @@ func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
 		return fmt.Errorf("unexpected status attempting to download update %d", resp.StatusCode)
 	}
 	resp.Body.Close()
-	etag := strings.Trim(resp.Header.Get("etag"), "\"")
-	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup")
-		etag = "_"
-	}
-	if etag, err = stagePathComponent(etag); err != nil {
-		return err
-	}
+	etag := stageDirName(resp.Header.Get("etag"))
 	filename := Installer
 	_, params, err := mime.ParseMediaType(resp.Header.Get("content-disposition"))
 	if err == nil {
@@ -229,14 +234,7 @@ func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("unexpected status attempting to download update %d", resp.StatusCode)
 	}
-	etag = strings.Trim(resp.Header.Get("etag"), "\"")
-	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup") // TODO probably can get rid of this redundant log
-		etag = "_"
-	}
-	if etag, err = stagePathComponent(etag); err != nil {
-		return err
-	}
+	etag = stageDirName(resp.Header.Get("etag"))
 
 	stageFilename = filepath.Join(UpdateStageDir, etag, filename)
 
