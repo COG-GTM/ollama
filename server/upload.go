@@ -275,7 +275,7 @@ func (b *blobUpload) uploadPart(ctx context.Context, method string, requestURL *
 	case resp.StatusCode == http.StatusUnauthorized:
 		w.Rollback()
 		challenge := parseRegistryChallenge(resp.Header.Get("www-authenticate"))
-		token, err := getAuthorizationToken(ctx, challenge)
+		token, err := getAuthorizationToken(ctx, challenge, requestURL)
 		if err != nil {
 			return err
 		}
@@ -284,12 +284,7 @@ func (b *blobUpload) uploadPart(ctx context.Context, method string, requestURL *
 		fallthrough
 	case resp.StatusCode >= http.StatusBadRequest:
 		w.Rollback()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-
-		return fmt.Errorf("http status %s: %s", resp.Status, body)
+		return registryError(resp)
 	}
 
 	if method == http.MethodPatch {
