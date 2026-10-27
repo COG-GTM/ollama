@@ -637,6 +637,77 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 	return nil
 }
 
+var errUnsafeZipEntry = errors.New("unsafe zip entry")
+
+// maxZipExtractSize caps the total uncompressed bytes written by extractZip.
+const maxZipExtractSize int64 = 512 << 30
+
+// extractZip unpacks r into dir. Entries must be regular files or
+// directories with local (non-absolute, non-escaping) names; archive mode
+// bits are ignored.
+func extractZip(r *zip.Reader, dir string) error {
+	var total int64
+	for _, f := range r.File {
+		name := filepath.FromSlash(f.Name)
+		if !filepath.IsLocal(name) || strings.ContainsRune(f.Name, '\\') {
+			return fmt.Errorf("%w: %q", errUnsafeZipEntry, f.Name)
+		}
+
+		mode := f.Mode()
+		if mode.IsDir() {
+			if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if !mode.IsRegular() {
+			return fmt.Errorf("%w: %q is not a regular file", errUnsafeZipEntry, f.Name)
+		}
+
+		if f.UncompressedSize64 > uint64(maxZipExtractSize-total) {
+			return fmt.Errorf("%w: archive exceeds %d bytes", errUnsafeZipEntry, maxZipExtractSize)
+		}
+
+		if err := extractZipFile(f, filepath.Join(dir, name)); err != nil {
+			return err
+		}
+
+		total += int64(f.UncompressedSize64)
+	}
+
+	return nil
+}
+
+func extractZipFile(f *zip.File, fpath string) error {
+	if err := os.MkdirAll(filepath.Dir(fpath), 0o755); err != nil {
+		return err
+	}
+
+	outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	n, err := io.Copy(outFile, io.LimitReader(rc, int64(f.UncompressedSize64)+1))
+	if err != nil {
+		return err
+	}
+
+	if uint64(n) != f.UncompressedSize64 {
+		return fmt.Errorf("%w: %q size does not match header", errUnsafeZipEntry, f.Name)
+	}
+
+	return outFile.Close()
+}
+
 func convertModel(name, path string, fn func(resp api.ProgressResponse)) (string, error) {
 	r, err := zip.OpenReader(path)
 	if err != nil {
@@ -651,25 +722,8 @@ func convertModel(name, path string, fn func(resp api.ProgressResponse)) (string
 	defer os.RemoveAll(tempDir)
 
 	fn(api.ProgressResponse{Status: "unpacking model metadata"})
-	for _, f := range r.File {
-		fpath := filepath.Join(tempDir, f.Name)
-		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-		if err != nil {
-			return "", err
-		}
-
-		rc, err := f.Open()
-		if err != nil {
-			return "", err
-		}
-
-		_, err = io.Copy(outFile, rc)
-		if err != nil {
-			return "", err
-		}
-
-		outFile.Close()
-		rc.Close()
+	if err := extractZip(&r.Reader, tempDir); err != nil {
+		return "", err
 	}
 
 	mf, err := convert.GetModelFormat(tempDir)
