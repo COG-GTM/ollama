@@ -637,6 +637,71 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 	return nil
 }
 
+var errUnsafeZipEntry = errors.New("unsafe zip entry")
+
+// extractZip extracts the regular files in r into dir. Entries whose names are
+// absolute or would resolve outside of dir are rejected, and archive mode bits
+// are ignored.
+func extractZip(r *zip.Reader, dir string) error {
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+
+	for _, f := range r.File {
+		name := filepath.FromSlash(f.Name)
+		if !filepath.IsLocal(name) || strings.Contains(f.Name, `\`) {
+			return fmt.Errorf("%w: %q", errUnsafeZipEntry, f.Name)
+		}
+
+		fpath := filepath.Join(root, name)
+		if !strings.HasPrefix(fpath, root+string(filepath.Separator)) {
+			return fmt.Errorf("%w: %q", errUnsafeZipEntry, f.Name)
+		}
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(fpath, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if !f.Mode().IsRegular() {
+			return fmt.Errorf("%w: %q is not a regular file", errUnsafeZipEntry, f.Name)
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), 0o755); err != nil {
+			return err
+		}
+
+		if err := extractZipFile(f, fpath); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func extractZipFile(f *zip.File, fpath string) error {
+	outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	if _, err := io.Copy(outFile, rc); err != nil {
+		return err
+	}
+
+	return outFile.Close()
+}
+
 func convertModel(name, path string, fn func(resp api.ProgressResponse)) (string, error) {
 	r, err := zip.OpenReader(path)
 	if err != nil {
@@ -651,25 +716,8 @@ func convertModel(name, path string, fn func(resp api.ProgressResponse)) (string
 	defer os.RemoveAll(tempDir)
 
 	fn(api.ProgressResponse{Status: "unpacking model metadata"})
-	for _, f := range r.File {
-		fpath := filepath.Join(tempDir, f.Name)
-		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-		if err != nil {
-			return "", err
-		}
-
-		rc, err := f.Open()
-		if err != nil {
-			return "", err
-		}
-
-		_, err = io.Copy(outFile, rc)
-		if err != nil {
-			return "", err
-		}
-
-		outFile.Close()
-		rc.Close()
+	if err := extractZip(&r.Reader, tempDir); err != nil {
+		return "", err
 	}
 
 	mf, err := convert.GetModelFormat(tempDir)
