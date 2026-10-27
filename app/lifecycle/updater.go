@@ -1,8 +1,11 @@
 package lifecycle
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +35,75 @@ var (
 type UpdateResponse struct {
 	UpdateURL     string `json:"url"`
 	UpdateVersion string `json:"version"`
+	// UpdateSHA256 is the optional hex encoded SHA-256 of the installer.
+	UpdateSHA256 string `json:"sha256,omitempty"`
+}
+
+const maxUpdateRedirects = 10
+
+// updateHTTPClient refuses to follow redirects away from https so the
+// installer is never fetched over plain http.
+var updateHTTPClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxUpdateRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxUpdateRedirects)
+		}
+		return validateUpdateURL(req.URL)
+	},
+}
+
+func validateUpdateURL(u *url.URL) error {
+	if u == nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" {
+		return fmt.Errorf("refusing non-https update URL %q", u)
+	}
+	return nil
+}
+
+func parseUpdateURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid update URL: %w", err)
+	}
+	if err := validateUpdateURL(u); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// stageDirName maps the server supplied ETag (which may be weak, W/"...",
+// or contain any other characters) to a fixed, path-safe directory name.
+func stageDirName(etag string) string {
+	etag = strings.TrimSpace(etag)
+	if etag == "" {
+		slog.Debug("no etag detected, falling back to filename based dedup")
+		return "_"
+	}
+	sum := sha256.Sum256([]byte(etag))
+	return hex.EncodeToString(sum[:16])
+}
+
+// stagePathComponent rejects server supplied filenames that are not a
+// single, plain path element.
+func stagePathComponent(name string) (string, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\:`) || name != filepath.Base(name) {
+		return "", fmt.Errorf("invalid update file name %q", name)
+	}
+	return name, nil
+}
+
+func verifyUpdateDigest(payload []byte, expected string) error {
+	if expected == "" {
+		return nil
+	}
+	want, err := hex.DecodeString(strings.TrimSpace(expected))
+	if err != nil || len(want) != sha256.Size {
+		return fmt.Errorf("invalid installer sha256 %q", expected)
+	}
+	got := sha256.Sum256(payload)
+	if !bytes.Equal(got[:], want) {
+		return fmt.Errorf("installer sha256 mismatch: got %x, expected %x", got, want)
+	}
+	return nil
 }
 
 func IsNewReleaseAvailable(ctx context.Context) (bool, UpdateResponse) {
@@ -96,6 +168,10 @@ func IsNewReleaseAvailable(ctx context.Context) (bool, UpdateResponse) {
 		slog.Warn(fmt.Sprintf("malformed response checking for update: %s", err))
 		return false, updateResp
 	}
+	if _, err := parseUpdateURL(updateResp.UpdateURL); err != nil {
+		slog.Warn(fmt.Sprintf("ignoring update: %s", err))
+		return false, updateResp
+	}
 	// Extract the version string from the URL in the github release artifact path
 	updateResp.UpdateVersion = path.Base(path.Dir(updateResp.UpdateURL))
 
@@ -104,13 +180,18 @@ func IsNewReleaseAvailable(ctx context.Context) (bool, UpdateResponse) {
 }
 
 func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
-	// Do a head first to check etag info
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, updateResp.UpdateURL, nil)
+	updateURL, err := parseUpdateURL(updateResp.UpdateURL)
 	if err != nil {
 		return err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	// Do a head first to check etag info
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, updateURL.String(), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := updateHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("error checking update: %w", err)
 	}
@@ -118,15 +199,14 @@ func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
 		return fmt.Errorf("unexpected status attempting to download update %d", resp.StatusCode)
 	}
 	resp.Body.Close()
-	etag := strings.Trim(resp.Header.Get("etag"), "\"")
-	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup")
-		etag = "_"
-	}
+	etag := stageDirName(resp.Header.Get("etag"))
 	filename := Installer
 	_, params, err := mime.ParseMediaType(resp.Header.Get("content-disposition"))
 	if err == nil {
 		filename = params["filename"]
+	}
+	if filename, err = stagePathComponent(filename); err != nil {
+		return err
 	}
 
 	stageFilename := filepath.Join(UpdateStageDir, etag, filename)
@@ -134,23 +214,27 @@ func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
 	// Check to see if we already have it downloaded
 	_, err = os.Stat(stageFilename)
 	if err == nil {
-		slog.Info("update already downloaded")
-		return nil
+		err := verifyStagedUpdate(stageFilename, updateResp.UpdateSHA256)
+		if err == nil {
+			slog.Info("update already downloaded")
+			UpdateDownloaded = true
+			return nil
+		}
+		slog.Warn(fmt.Sprintf("discarding previously downloaded update %s: %s", stageFilename, err))
 	}
 
 	cleanupOldDownloads()
 
 	req.Method = http.MethodGet
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = updateHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("error checking update: %w", err)
 	}
 	defer resp.Body.Close()
-	etag = strings.Trim(resp.Header.Get("etag"), "\"")
-	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup") // TODO probably can get rid of this redundant log
-		etag = "_"
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("unexpected status attempting to download update %d", resp.StatusCode)
 	}
+	etag = stageDirName(resp.Header.Get("etag"))
 
 	stageFilename = filepath.Join(UpdateStageDir, etag, filename)
 
@@ -165,18 +249,57 @@ func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
 	if err != nil {
 		return fmt.Errorf("failed to read body response: %w", err)
 	}
-	fp, err := os.OpenFile(stageFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
-	if err != nil {
-		return fmt.Errorf("write payload %s: %w", stageFilename, err)
+	if err := verifyUpdateDigest(payload, updateResp.UpdateSHA256); err != nil {
+		return err
 	}
-	defer fp.Close()
-	if n, err := fp.Write(payload); err != nil || n != len(payload) {
-		return fmt.Errorf("write payload %s: %d vs %d -- %w", stageFilename, n, len(payload), err)
+
+	// Write to a temporary name so an unverified installer is never left
+	// where DoUpgrade looks for it.
+	pendingFilename := stageFilename + ".pending"
+	if err := writeStagedPayload(pendingFilename, payload); err != nil {
+		os.Remove(pendingFilename) //nolint:errcheck
+		return err
 	}
-	slog.Info("new update downloaded " + stageFilename)
+	if err := verifyInstaller(pendingFilename); err != nil {
+		os.Remove(pendingFilename) //nolint:errcheck
+		return fmt.Errorf("downloaded update failed verification: %w", err)
+	}
+	if err := os.Rename(pendingFilename, stageFilename); err != nil {
+		os.Remove(pendingFilename) //nolint:errcheck
+		return fmt.Errorf("stage update %s: %w", stageFilename, err)
+	}
+	slog.Info("new update downloaded and verified " + stageFilename)
 
 	UpdateDownloaded = true
 	return nil
+}
+
+func writeStagedPayload(filename string, payload []byte) error {
+	fp, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return fmt.Errorf("write payload %s: %w", filename, err)
+	}
+	if n, err := fp.Write(payload); err != nil || n != len(payload) {
+		fp.Close()
+		return fmt.Errorf("write payload %s: %d vs %d -- %w", filename, n, len(payload), err)
+	}
+	if err := fp.Close(); err != nil {
+		return fmt.Errorf("write payload %s: %w", filename, err)
+	}
+	return nil
+}
+
+func verifyStagedUpdate(filename, expectedSHA256 string) error {
+	if expectedSHA256 != "" {
+		payload, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+		if err := verifyUpdateDigest(payload, expectedSHA256); err != nil {
+			return err
+		}
+	}
+	return verifyInstaller(filename)
 }
 
 func cleanupOldDownloads() {
@@ -210,10 +333,11 @@ func StartBackgroundUpdaterChecker(ctx context.Context, cb func(string) error) {
 				err := DownloadNewRelease(ctx, resp)
 				if err != nil {
 					slog.Error(fmt.Sprintf("failed to download new release: %s", err))
-				}
-				err = cb(resp.UpdateVersion)
-				if err != nil {
-					slog.Warn(fmt.Sprintf("failed to register update available with tray: %s", err))
+				} else {
+					err = cb(resp.UpdateVersion)
+					if err != nil {
+						slog.Warn(fmt.Sprintf("failed to register update available with tray: %s", err))
+					}
 				}
 			}
 			select {

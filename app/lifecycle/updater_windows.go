@@ -22,6 +22,15 @@ func DoUpgrade(cancel context.CancelFunc, done chan int) error {
 	}
 	installerExe := files[0]
 
+	if err := verifyInstaller(installerExe); err != nil {
+		slog.Error(fmt.Sprintf("refusing to run update installer %s: %s", installerExe, err))
+		if rmErr := os.Remove(installerExe); rmErr != nil {
+			slog.Warn(fmt.Sprintf("failed to remove rejected update installer: %s", rmErr))
+		}
+		UpdateDownloaded = false
+		return fmt.Errorf("update installer %s failed verification: %w", installerExe, err)
+	}
+
 	slog.Info("starting upgrade with " + installerExe)
 	slog.Info("upgrade log file " + UpgradeLogFile)
 
