@@ -7,8 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,6 +25,71 @@ type registryChallenge struct {
 	Realm   string
 	Service string
 	Scope   string
+}
+
+var errUntrustedRealm = errors.New("untrusted registry auth realm")
+
+// trustedRealmHosts lists the token realm hosts, other than the registry
+// itself, that a registry may delegate authentication to.
+var trustedRealmHosts = map[string][]string{
+	DefaultRegistry: {"ollama.com"},
+}
+
+// signingRegistries lists the registries that are trusted to receive token
+// requests signed with the local Ollama key.
+var signingRegistries = map[string]bool{
+	DefaultRegistry: true,
+	"ollama.com":    true,
+}
+
+// canonicalHost returns the lowercased host of u with the default port for
+// its scheme removed.
+func canonicalHost(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		port = ""
+	}
+
+	if port != "" {
+		return net.JoinHostPort(host, port)
+	}
+
+	return host
+}
+
+// validateRealm reports whether realm may be used to obtain a token for
+// requests to registry. The realm must use https (http is only accepted for
+// insecure registries) and must be served by the registry itself or by a host
+// the registry is known to delegate to.
+func validateRealm(realm, registry *url.URL, insecure bool) error {
+	switch realm.Scheme {
+	case "https":
+	case "http":
+		if !insecure {
+			return fmt.Errorf("%w: realm %q must use https", errUntrustedRealm, realm.Redacted())
+		}
+	default:
+		return fmt.Errorf("%w: realm %q must use https", errUntrustedRealm, realm.Redacted())
+	}
+
+	if realm.User != nil || realm.Host == "" {
+		return fmt.Errorf("%w: invalid realm %q", errUntrustedRealm, realm.Redacted())
+	}
+
+	realmHost := canonicalHost(realm)
+	registryHost := canonicalHost(registry)
+	if realmHost == registryHost {
+		return nil
+	}
+
+	for _, h := range trustedRealmHosts[registryHost] {
+		if realmHost == h {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("%w: realm host %q does not match registry host %q", errUntrustedRealm, realmHost, registryHost)
 }
 
 func (r registryChallenge) URL() (*url.URL, error) {
@@ -50,22 +117,31 @@ func (r registryChallenge) URL() (*url.URL, error) {
 	return redirectURL, nil
 }
 
-func getAuthorizationToken(ctx context.Context, challenge registryChallenge) (string, error) {
+// getAuthorizationToken fetches a token for the registry that served
+// registryURL from the realm in challenge. The request is only signed with the
+// local Ollama key when the registry is the Ollama registry.
+func getAuthorizationToken(ctx context.Context, challenge registryChallenge, registryURL *url.URL, insecure bool) (string, error) {
 	redirectURL, err := challenge.URL()
 	if err != nil {
 		return "", err
 	}
 
-	sha256sum := sha256.Sum256(nil)
-	data := []byte(fmt.Sprintf("%s,%s,%s", http.MethodGet, redirectURL.String(), base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sha256sum[:])))))
-
-	headers := make(http.Header)
-	signature, err := auth.Sign(ctx, data)
-	if err != nil {
+	if err := validateRealm(redirectURL, registryURL, insecure); err != nil {
 		return "", err
 	}
 
-	headers.Add("Authorization", signature)
+	headers := make(http.Header)
+	if signingRegistries[canonicalHost(registryURL)] {
+		sha256sum := sha256.Sum256(nil)
+		data := []byte(fmt.Sprintf("%s,%s,%s", http.MethodGet, redirectURL.String(), base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sha256sum[:])))))
+
+		signature, err := auth.Sign(ctx, data)
+		if err != nil {
+			return "", err
+		}
+
+		headers.Add("Authorization", signature)
+	}
 
 	response, err := makeRequest(ctx, http.MethodGet, redirectURL, headers, nil, nil)
 	if err != nil {

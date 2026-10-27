@@ -41,6 +41,9 @@ type registryOptions struct {
 	Username string
 	Password string
 	Token    string
+	// TokenHost is the registry host Token was issued for. Token is only
+	// sent to requests for this host.
+	TokenHost string
 }
 
 type Model struct {
@@ -1193,12 +1196,13 @@ func makeRequestWithRetry(ctx context.Context, method string, requestURL *url.UR
 		case resp.StatusCode == http.StatusUnauthorized:
 			// Handle authentication error with one retry
 			challenge := parseRegistryChallenge(resp.Header.Get("www-authenticate"))
-			token, err := getAuthorizationToken(ctx, challenge)
+			token, err := getAuthorizationToken(ctx, challenge, requestURL, regOpts.Insecure)
 			if err != nil {
 				return nil, err
 			}
 			anonymous = getTokenSubject(token) == "anonymous"
 			regOpts.Token = token
+			regOpts.TokenHost = canonicalHost(requestURL)
 			if body != nil {
 				_, err = body.Seek(0, io.SeekStart)
 				if err != nil {
@@ -1247,7 +1251,9 @@ func makeRequest(ctx context.Context, method string, requestURL *url.URL, header
 
 	if regOpts != nil {
 		if regOpts.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+regOpts.Token)
+			if regOpts.TokenHost != "" && regOpts.TokenHost == canonicalHost(requestURL) {
+				req.Header.Set("Authorization", "Bearer "+regOpts.Token)
+			}
 		} else if regOpts.Username != "" && regOpts.Password != "" {
 			req.SetBasicAuth(regOpts.Username, regOpts.Password)
 		}
