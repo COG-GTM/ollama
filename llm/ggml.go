@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"strings"
 )
 
@@ -263,6 +264,26 @@ func (t Tensor) parameters() uint64 {
 
 func (t Tensor) size() uint64 {
 	return t.parameters() * t.typeSize() / t.blockSize()
+}
+
+// checkedSize is size with overflow detection; ok is false if the
+// computation does not fit in a uint64.
+func (t Tensor) checkedSize() (size uint64, ok bool) {
+	var count uint64 = 1
+	for _, n := range t.Shape {
+		hi, lo := bits.Mul64(count, n)
+		if hi != 0 {
+			return 0, false
+		}
+		count = lo
+	}
+
+	hi, lo := bits.Mul64(count, t.typeSize())
+	if hi != 0 {
+		return 0, false
+	}
+
+	return lo / t.blockSize(), true
 }
 
 type container interface {
