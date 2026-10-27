@@ -221,6 +221,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	var generated strings.Builder
 	go func() {
 		defer close(ch)
+		defer recoverStreamPanic(ch)
 
 		fn := func(r llm.CompletionResponse) {
 			// Build up the full response
@@ -447,6 +448,7 @@ func (s *Server) PullModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer recoverStreamPanic(ch)
 		fn := func(r api.ProgressResponse) {
 			ch <- r
 		}
@@ -496,6 +498,7 @@ func (s *Server) PushModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer recoverStreamPanic(ch)
 		fn := func(r api.ProgressResponse) {
 			ch <- r
 		}
@@ -518,6 +521,16 @@ func (s *Server) PushModelHandler(c *gin.Context) {
 	}
 
 	streamResponse(c, ch)
+}
+
+// recoverStreamPanic must be deferred directly in a handler goroutine. It turns
+// a panic into an error on the response stream instead of crashing the server,
+// since gin's recovery middleware does not cover spawned goroutines.
+func recoverStreamPanic(ch chan any) {
+	if r := recover(); r != nil {
+		slog.Error("recovered from panic in handler goroutine", "error", r)
+		ch <- gin.H{"error": fmt.Sprintf("internal error: %v", r)}
+	}
 }
 
 func (s *Server) CreateModelHandler(c *gin.Context) {
@@ -573,6 +586,7 @@ func (s *Server) CreateModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer recoverStreamPanic(ch)
 		fn := func(resp api.ProgressResponse) {
 			ch <- resp
 		}
@@ -1285,6 +1299,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 	go func() {
 		defer close(ch)
+		defer recoverStreamPanic(ch)
 
 		fn := func(r llm.CompletionResponse) {
 
