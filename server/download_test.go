@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -90,6 +91,32 @@ func TestBlobDownloadPrepareRejectsBadContentLength(t *testing.T) {
 				t.Fatalf("expected no parts, got %d", len(b.Parts))
 			}
 		})
+	}
+}
+
+func TestBlobDownloadPrepareDiscardsInvalidParts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	name := filepath.Join(t.TempDir(), "blob")
+	tampered := &blobDownloadPart{N: 0, Offset: 0, Size: math.MaxInt64}
+	b := &blobDownload{Name: name, Digest: testDigest}
+	tampered.blobDownload = b
+	if err := b.writePart(tampered.Name(), tampered); err != nil {
+		t.Fatal(err)
+	}
+
+	u, _ := url.Parse(srv.URL + "/v2/library/m/blobs/" + testDigest)
+	b = &blobDownload{Name: name, Digest: testDigest}
+	if err := b.Prepare(context.Background(), u, &registryOptions{Insecure: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if b.Total != 1024 || len(b.Parts) != 1 || b.Parts[0].Size != 1024 {
+		t.Fatalf("expected a fresh 1024 byte part, got total %d, parts %+v", b.Total, b.Parts)
 	}
 }
 

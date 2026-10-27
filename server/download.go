@@ -108,6 +108,19 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 		b.Parts = append(b.Parts, part)
 	}
 
+	if err := b.validateParts(); err != nil {
+		slog.Warn("discarding invalid partial download", "digest", b.Digest, "error", err)
+		for _, partFilePath := range partFilePaths {
+			if err := os.Remove(partFilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+
+		b.Total = 0
+		b.Completed.Store(0)
+		b.Parts = nil
+	}
+
 	if len(b.Parts) == 0 {
 		resp, err := makeRequestWithRetry(ctx, http.MethodHead, requestURL, nil, nil, opts)
 		if err != nil {
@@ -153,6 +166,25 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 	}
 
 	slog.Info(fmt.Sprintf("downloading %s in %d %s part(s)", b.Digest[7:19], len(b.Parts), format.HumanBytes(b.Parts[0].Size)))
+	return nil
+}
+
+// validateParts checks part metadata restored from disk so a resumed
+// download is held to the same bounds as a fresh one.
+func (b *blobDownload) validateParts() error {
+	var total int64
+	for _, part := range b.Parts {
+		if part.Size <= 0 || part.Size > maxDownloadPartSize || part.Offset < 0 ||
+			part.Completed < 0 || part.Completed > part.Size {
+			return fmt.Errorf("invalid part %d: offset %d, size %d, completed %d", part.N, part.Offset, part.Size, part.Completed)
+		}
+
+		total += part.Size
+		if total > maxDownloadSize || part.Offset > maxDownloadSize-part.Size {
+			return fmt.Errorf("parts exceed maximum blob size %d", maxDownloadSize)
+		}
+	}
+
 	return nil
 }
 
