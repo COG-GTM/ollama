@@ -528,7 +528,7 @@ func (s *Server) PushModelHandler(c *gin.Context) {
 func recoverToStream(ch chan any) {
 	if r := recover(); r != nil {
 		slog.Error("recovered from panic", "error", r, "stack", string(debug.Stack()))
-		ch <- gin.H{"error": fmt.Sprintf("internal error: %v", r)}
+		ch <- gin.H{"error": "internal server error"}
 	}
 }
 

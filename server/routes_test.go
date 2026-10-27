@@ -316,7 +316,7 @@ func TestRecoverToStream(t *testing.T) {
 
 	select {
 	case resp := <-ch:
-		assert.Equal(t, gin.H{"error": "internal error: boom"}, resp)
+		assert.Equal(t, gin.H{"error": "internal server error"}, resp)
 	default:
 		t.Fatal("expected an error response after panic")
 	}
