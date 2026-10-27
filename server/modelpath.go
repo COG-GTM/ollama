@@ -78,6 +78,32 @@ func (mp ModelPath) Validate() error {
 		return fmt.Errorf("%w: ':' (colon) is not allowed in tag names", errModelPathInvalid)
 	}
 
+	for _, part := range []struct{ kind, value string }{
+		{"registry", mp.Registry},
+		{"namespace", mp.Namespace},
+		{"repository", mp.Repository},
+		{"tag", mp.Tag},
+	} {
+		if err := validatePathPart(part.kind, part.value); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validatePathPart rejects model path parts that cannot safely be used as a
+// single path element under the manifests directory.
+func validatePathPart(kind, s string) error {
+	switch {
+	case s == "":
+		return fmt.Errorf("%w: %s name is required", errModelPathInvalid, kind)
+	case s == "." || s == "..":
+		return fmt.Errorf("%w: %q is not allowed as a %s name", errModelPathInvalid, s, kind)
+	case strings.ContainsAny(s, "/\\\x00"):
+		return fmt.Errorf("%w: path separators are not allowed in %s names", errModelPathInvalid, kind)
+	}
+
 	return nil
 }
 
@@ -114,12 +140,23 @@ func modelsDir() (string, error) {
 
 // GetManifestPath returns the path to the manifest file for the given model path, it is up to the caller to create the directory if it does not exist.
 func (mp ModelPath) GetManifestPath() (string, error) {
+	if err := mp.Validate(); err != nil {
+		return "", err
+	}
+
 	dir, err := modelsDir()
 	if err != nil {
 		return "", err
 	}
 
-	return filepath.Join(dir, "manifests", mp.Registry, mp.Namespace, mp.Repository, mp.Tag), nil
+	manifests := filepath.Join(dir, "manifests")
+	fp := filepath.Join(manifests, mp.Registry, mp.Namespace, mp.Repository, mp.Tag)
+	rel, err := filepath.Rel(manifests, fp)
+	if err != nil || !filepath.IsLocal(rel) || rel == "." {
+		return "", fmt.Errorf("%w: manifest path escapes the manifests directory", errModelPathInvalid)
+	}
+
+	return fp, nil
 }
 
 func (mp ModelPath) BaseURL() *url.URL {

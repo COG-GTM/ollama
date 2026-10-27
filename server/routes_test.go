@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -240,4 +241,50 @@ func Test_Routes(t *testing.T) {
 		}
 
 	}
+}
+
+func TestModelPathTraversalRoutes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("OLLAMA_MODELS", filepath.Join(home, ".ollama", "models"))
+
+	victim := filepath.Join(home, ".ollama", "id_ed25519")
+	assert.Nil(t, os.MkdirAll(filepath.Dir(victim), 0o755))
+	original := []byte(`{"config":{"digest":"sha256:0"},"layers":[]}`)
+	assert.Nil(t, os.WriteFile(victim, original, 0o600))
+
+	s := &Server{}
+	httpSrv := httptest.NewServer(s.GenerateRoutes())
+	t.Cleanup(httpSrv.Close)
+
+	stream := false
+	modelfile := filepath.Join(t.TempDir(), "Modelfile")
+	cases := []struct {
+		method, path string
+		body         any
+	}{
+		{http.MethodPost, "/api/create", api.CreateRequest{Name: "../..:id_ed25519", Modelfile: "FROM " + modelfile, Stream: &stream}},
+		{http.MethodDelete, "/api/delete", api.DeleteRequest{Name: "../..:id_ed25519"}},
+		{http.MethodPost, "/api/pull", api.PullRequest{Name: "../..:id_ed25519", Stream: &stream}},
+		{http.MethodPost, "/api/push", api.PushRequest{Name: "../..:id_ed25519", Stream: &stream}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			b, err := json.Marshal(tc.body)
+			assert.Nil(t, err)
+
+			req, err := http.NewRequestWithContext(context.TODO(), tc.method, httpSrv.URL+tc.path, bytes.NewReader(b))
+			assert.Nil(t, err)
+
+			resp, err := httpSrv.Client().Do(req)
+			assert.Nil(t, err)
+			defer resp.Body.Close()
+
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		})
+	}
+
+	got, err := os.ReadFile(victim)
+	assert.Nil(t, err)
+	assert.Equal(t, original, got)
 }
