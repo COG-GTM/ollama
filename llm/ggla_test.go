@@ -3,6 +3,8 @@ package llm
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"testing"
 	"time"
 )
@@ -46,7 +48,24 @@ func encodeGGLA(t *testing.T, tensors ...gglaTestTensor) []byte {
 	return b.Bytes()
 }
 
+// noSeekEndReader rejects io.SeekEnd, like a stream of unknown length.
+type noSeekEndReader struct {
+	*bytes.Reader
+}
+
+func (r noSeekEndReader) Seek(offset int64, whence int) (int64, error) {
+	if whence == io.SeekEnd {
+		return 0, errors.New("unknown length")
+	}
+	return r.Reader.Seek(offset, whence)
+}
+
 func decodeGGLAWithTimeout(t *testing.T, data []byte) (*GGML, int64, error) {
+	t.Helper()
+	return decodeWithTimeout(t, bytes.NewReader(data))
+}
+
+func decodeWithTimeout(t *testing.T, rs io.ReadSeeker) (*GGML, int64, error) {
 	t.Helper()
 
 	type result struct {
@@ -57,7 +76,7 @@ func decodeGGLAWithTimeout(t *testing.T, data []byte) (*GGML, int64, error) {
 
 	done := make(chan result, 1)
 	go func() {
-		ggml, size, err := DecodeGGML(bytes.NewReader(data))
+		ggml, size, err := DecodeGGML(rs)
 		done <- result{ggml, size, err}
 	}()
 
@@ -121,5 +140,22 @@ func TestGGLADecodeRejectsMalformed(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+func TestGGLADecodeWithoutSeekEnd(t *testing.T) {
+	valid := encodeGGLA(t, gglaTestTensor{kind: 0, shape: []uint32{2, 2}, name: "a.weight", data: make([]byte, 16)})
+	ggml, _, err := decodeWithTimeout(t, noSeekEndReader{bytes.NewReader(valid)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if n := len(ggml.Tensors()); n != 1 {
+		t.Fatalf("got %d tensors, want 1", n)
+	}
+
+	loop := encodeGGLA(t, gglaTestTensor{kind: 0, shape: []uint32{4294967292, 3221225475}})
+	if _, _, err := decodeWithTimeout(t, noSeekEndReader{bytes.NewReader(loop)}); err == nil {
+		t.Fatal("expected error")
 	}
 }

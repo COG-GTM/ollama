@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 )
 
@@ -63,9 +64,10 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 		return err
 	}
 
+	// readers that cannot seek from the end are bounded only by int64
 	end, err := rs.Seek(0, io.SeekEnd)
 	if err != nil {
-		return err
+		end = math.MaxInt64
 	}
 
 	if _, err := rs.Seek(start, io.SeekStart); err != nil {
