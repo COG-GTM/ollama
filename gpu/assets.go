@@ -100,12 +100,16 @@ func PayloadsDir() (string, error) {
 
 		handle, err := os.Open(tmpDir)
 		if err != nil {
+			os.Remove(tmpDir)
 			return "", err
 		}
 
 		// Track our pid so we can clean up orphaned tmpdirs
 		pidFilePath := filepath.Join(tmpDir, "ollama.pid")
 		if err := os.WriteFile(pidFilePath, []byte(fmt.Sprint(os.Getpid())), 0o600); err != nil {
+			if checkPayloadsRoot(tmpDir, handle) == nil {
+				os.RemoveAll(tmpDir)
+			}
 			handle.Close()
 			return "", err
 		}
