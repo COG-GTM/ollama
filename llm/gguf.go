@@ -3,8 +3,10 @@ package llm
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"log/slog"
@@ -54,6 +56,14 @@ func (c *containerGGUF) Decode(rs io.ReadSeeker) (model, error) {
 	}
 
 	model := newGGUF(c)
+	if n := model.numKV(); n > maxGGUFKVCount {
+		return nil, fmt.Errorf("%w: %d key-values exceeds %d", ErrGGUFLimitExceeded, n, maxGGUFKVCount)
+	}
+
+	if n := model.numTensor(); n > maxGGUFTensorCount {
+		return nil, fmt.Errorf("%w: %d tensors exceeds %d", ErrGGUFLimitExceeded, n, maxGGUFTensorCount)
+	}
+
 	slog.Debug(fmt.Sprintf("model = %#v", model))
 	if err := model.Decode(rs); err != nil {
 		return nil, err
@@ -61,6 +71,23 @@ func (c *containerGGUF) Decode(rs io.ReadSeeker) (model, error) {
 
 	return model, nil
 }
+
+// Upper bounds on counts and lengths read from a GGUF header. They are far
+// above what real models use but keep a crafted file from driving unbounded
+// allocation.
+const (
+	maxGGUFKVCount      = 1 << 16
+	maxGGUFTensorCount  = 1 << 20
+	maxGGUFTensorDims   = 4
+	maxGGUFArrayLength  = 1 << 24
+	maxGGUFStringLength = 64 << 20
+
+	// ggufReadChunk bounds how many elements or bytes are allocated ahead of
+	// the data actually being present in the file.
+	ggufReadChunk = 1 << 16
+)
+
+var ErrGGUFLimitExceeded = errors.New("gguf: limit exceeded")
 
 const (
 	_ uint32 = iota
@@ -203,7 +230,11 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 			return err
 		}
 
-		shape := [4]uint64{1, 1, 1, 1}
+		if dims > maxGGUFTensorDims {
+			return fmt.Errorf("%w: tensor %q has %d dimensions, max %d", ErrGGUFLimitExceeded, name, dims, maxGGUFTensorDims)
+		}
+
+		shape := [maxGGUFTensorDims]uint64{1, 1, 1, 1}
 		for i := 0; uint32(i) < dims; i++ {
 			shape[i], err = readGGUF[uint64](llm, rs)
 			if err != nil {
@@ -236,7 +267,7 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 	llm.kv["general.parameter_count"] = llm.parameters
 
 	alignment, ok := llm.kv["general.alignment"].(uint32)
-	if !ok {
+	if !ok || alignment == 0 {
 		alignment = 32
 	}
 
@@ -278,21 +309,33 @@ func writeGGUF[V any](llm *gguf, w io.Writer, t uint32, v V) error {
 	return binary.Write(w, llm.ByteOrder, v)
 }
 
+func readGGUFStringData(r io.Reader, length uint64) (string, error) {
+	if length > maxGGUFStringLength {
+		return "", fmt.Errorf("%w: string length %d exceeds %d", ErrGGUFLimitExceeded, length, maxGGUFStringLength)
+	}
+
+	var b bytes.Buffer
+	b.Grow(int(min(length, ggufReadChunk)))
+	if _, err := io.CopyN(&b, r, int64(length)); err != nil {
+		return "", err
+	}
+
+	return b.String(), nil
+}
+
 func readGGUFV1String(llm *gguf, r io.Reader) (string, error) {
 	var length uint64
 	if err := binary.Read(r, llm.ByteOrder, &length); err != nil {
 		return "", err
 	}
 
-	var b bytes.Buffer
-	if _, err := io.CopyN(&b, r, int64(length)); err != nil {
+	s, err := readGGUFStringData(r, length)
+	if err != nil {
 		return "", err
 	}
 
 	// gguf v1 strings are null-terminated
-	b.Truncate(b.Len() - 1)
-
-	return b.String(), nil
+	return strings.TrimSuffix(s, "\x00"), nil
 }
 
 func readGGUFString(llm *gguf, r io.Reader) (string, error) {
@@ -305,12 +348,7 @@ func readGGUFString(llm *gguf, r io.Reader) (string, error) {
 		return "", err
 	}
 
-	var b bytes.Buffer
-	if _, err := io.CopyN(&b, r, int64(length)); err != nil {
-		return "", err
-	}
-
-	return b.String(), nil
+	return readGGUFStringData(r, length)
 }
 
 func writeGGUFString(llm *gguf, w io.Writer, s string) error {
@@ -326,7 +364,7 @@ func writeGGUFString(llm *gguf, w io.Writer, s string) error {
 	return err
 }
 
-func readGGUFV1Array(llm *gguf, r io.Reader) (a []any, err error) {
+func readGGUFV1Array(llm *gguf, r io.Reader) (any, error) {
 	t, err := readGGUF[uint32](llm, r)
 	if err != nil {
 		return nil, err
@@ -337,47 +375,12 @@ func readGGUFV1Array(llm *gguf, r io.Reader) (a []any, err error) {
 		return nil, err
 	}
 
-	for i := 0; uint32(i) < n; i++ {
-		var e any
-		switch t {
-		case ggufTypeUint8:
-			e, err = readGGUF[uint8](llm, r)
-		case ggufTypeInt8:
-			e, err = readGGUF[int8](llm, r)
-		case ggufTypeUint16:
-			e, err = readGGUF[uint16](llm, r)
-		case ggufTypeInt16:
-			e, err = readGGUF[int16](llm, r)
-		case ggufTypeUint32:
-			e, err = readGGUF[uint32](llm, r)
-		case ggufTypeInt32:
-			e, err = readGGUF[int32](llm, r)
-		case ggufTypeUint64:
-			e, err = readGGUF[uint64](llm, r)
-		case ggufTypeInt64:
-			e, err = readGGUF[int64](llm, r)
-		case ggufTypeFloat32:
-			e, err = readGGUF[float32](llm, r)
-		case ggufTypeFloat64:
-			e, err = readGGUF[float64](llm, r)
-		case ggufTypeBool:
-			e, err = readGGUF[bool](llm, r)
-		case ggufTypeString:
-			e, err = readGGUFV1String(llm, r)
-		default:
-			return nil, fmt.Errorf("invalid array type: %d", t)
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		a = append(a, e)
-	}
-
-	return
+	return readGGUFArrayElements(llm, r, t, uint64(n))
 }
 
-func readGGUFArray(llm *gguf, r io.Reader) (a []any, err error) {
+// readGGUFArray returns the array as a typed slice (e.g. []uint8, []float32,
+// []string) rather than []any to avoid boxing every element.
+func readGGUFArray(llm *gguf, r io.Reader) (any, error) {
 	if llm.Version == 1 {
 		return readGGUFV1Array(llm, r)
 	}
@@ -392,44 +395,71 @@ func readGGUFArray(llm *gguf, r io.Reader) (a []any, err error) {
 		return nil, err
 	}
 
-	for i := 0; uint64(i) < n; i++ {
-		var e any
-		switch t {
-		case ggufTypeUint8:
-			e, err = readGGUF[uint8](llm, r)
-		case ggufTypeInt8:
-			e, err = readGGUF[int8](llm, r)
-		case ggufTypeUint16:
-			e, err = readGGUF[uint16](llm, r)
-		case ggufTypeInt16:
-			e, err = readGGUF[int16](llm, r)
-		case ggufTypeUint32:
-			e, err = readGGUF[uint32](llm, r)
-		case ggufTypeInt32:
-			e, err = readGGUF[int32](llm, r)
-		case ggufTypeUint64:
-			e, err = readGGUF[uint64](llm, r)
-		case ggufTypeInt64:
-			e, err = readGGUF[int64](llm, r)
-		case ggufTypeFloat32:
-			e, err = readGGUF[float32](llm, r)
-		case ggufTypeFloat64:
-			e, err = readGGUF[float64](llm, r)
-		case ggufTypeBool:
-			e, err = readGGUF[bool](llm, r)
-		case ggufTypeString:
-			e, err = readGGUFString(llm, r)
-		default:
-			return nil, fmt.Errorf("invalid array type: %d", t)
-		}
-		if err != nil {
-			return nil, err
-		}
+	return readGGUFArrayElements(llm, r, t, n)
+}
 
-		a = append(a, e)
+func readGGUFArrayElements(llm *gguf, r io.Reader, t uint32, n uint64) (any, error) {
+	if n > maxGGUFArrayLength {
+		return nil, fmt.Errorf("%w: array length %d exceeds %d", ErrGGUFLimitExceeded, n, maxGGUFArrayLength)
 	}
 
-	return
+	switch t {
+	case ggufTypeUint8:
+		return readGGUFArrayData[uint8](llm, r, n)
+	case ggufTypeInt8:
+		return readGGUFArrayData[int8](llm, r, n)
+	case ggufTypeUint16:
+		return readGGUFArrayData[uint16](llm, r, n)
+	case ggufTypeInt16:
+		return readGGUFArrayData[int16](llm, r, n)
+	case ggufTypeUint32:
+		return readGGUFArrayData[uint32](llm, r, n)
+	case ggufTypeInt32:
+		return readGGUFArrayData[int32](llm, r, n)
+	case ggufTypeUint64:
+		return readGGUFArrayData[uint64](llm, r, n)
+	case ggufTypeInt64:
+		return readGGUFArrayData[int64](llm, r, n)
+	case ggufTypeFloat32:
+		return readGGUFArrayData[float32](llm, r, n)
+	case ggufTypeFloat64:
+		return readGGUFArrayData[float64](llm, r, n)
+	case ggufTypeBool:
+		return readGGUFArrayData[bool](llm, r, n)
+	case ggufTypeString:
+		a := make([]string, 0, min(n, ggufReadChunk))
+		for i := uint64(0); i < n; i++ {
+			e, err := readGGUFString(llm, r)
+			if err != nil {
+				return nil, err
+			}
+
+			a = append(a, e)
+		}
+
+		return a, nil
+	default:
+		return nil, fmt.Errorf("invalid array type: %d", t)
+	}
+}
+
+// readGGUFArrayData reads n fixed-size elements in bounded chunks so memory
+// grows only as data is actually read from the file.
+func readGGUFArrayData[T uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | float32 | float64 | bool](llm *gguf, r io.Reader, n uint64) ([]T, error) {
+	var a []T
+	for uint64(len(a)) < n {
+		start, k := len(a), int(min(n-uint64(len(a)), ggufReadChunk))
+		if cap(a)-start < k {
+			a = slices.Grow(a, max(k, start))
+		}
+
+		a = a[:start+k]
+		if err := binary.Read(r, llm.ByteOrder, a[start:]); err != nil {
+			return nil, err
+		}
+	}
+
+	return a, nil
 }
 
 func writeGGUFArray[S ~[]E, E any](llm *gguf, w io.Writer, t uint32, s S) error {

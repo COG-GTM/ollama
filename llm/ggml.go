@@ -329,7 +329,8 @@ func (llm GGML) GraphSize(context, batch uint64) (partialOffload, fullOffload ui
 	embedding := llm.KV().EmbeddingLength()
 	heads := llm.KV().HeadCount()
 	headsKV := llm.KV().HeadCountKV()
-	vocab := uint64(len(llm.KV()["tokenizer.ggml.tokens"].([]any)))
+	tokens, _ := llm.KV()["tokenizer.ggml.tokens"].([]string)
+	vocab := uint64(len(tokens))
 
 	layers := llm.Tensors().Layers()
 
