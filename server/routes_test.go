@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/ollama/ollama/api"
@@ -239,5 +241,83 @@ func Test_Routes(t *testing.T) {
 			tc.Expected(t, resp)
 		}
 
+	}
+}
+
+func TestCreateModelMalformedGGUF(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	s := &Server{}
+	httpSrv := httptest.NewServer(s.GenerateRoutes())
+	t.Cleanup(httpSrv.Close)
+
+	gguf := func(version uint32, kv func(*bytes.Buffer)) []byte {
+		var b bytes.Buffer
+		b.WriteString("GGUF")
+		_ = binary.Write(&b, binary.LittleEndian, version)
+		if version == 1 {
+			_ = binary.Write(&b, binary.LittleEndian, []uint32{0, 1})
+		} else {
+			_ = binary.Write(&b, binary.LittleEndian, []uint64{0, 1})
+		}
+		kv(&b)
+		return b.Bytes()
+	}
+
+	cases := map[string][]byte{
+		"zero alignment": gguf(3, func(b *bytes.Buffer) {
+			key := "general.alignment"
+			_ = binary.Write(b, binary.LittleEndian, uint64(len(key)))
+			b.WriteString(key)
+			_ = binary.Write(b, binary.LittleEndian, []uint32{4, 0})
+		}),
+		"v1 empty string": gguf(1, func(b *bytes.Buffer) {
+			_ = binary.Write(b, binary.LittleEndian, uint64(0))
+		}),
+	}
+
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+
+			resp, err := httpSrv.Client().Post(httpSrv.URL+"/api/blobs/"+digest, "application/octet-stream", bytes.NewReader(data))
+			assert.Nil(t, err)
+			resp.Body.Close()
+			assert.Equal(t, http.StatusCreated, resp.StatusCode)
+
+			stream := false
+			body, err := json.Marshal(api.CreateRequest{
+				Name:      "malformed",
+				Modelfile: fmt.Sprintf("FROM @%s", digest),
+				Stream:    &stream,
+			})
+			assert.Nil(t, err)
+
+			resp, err = httpSrv.Client().Post(httpSrv.URL+"/api/create", "application/json", bytes.NewReader(body))
+			assert.Nil(t, err)
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+
+			var errResp struct {
+				Error string `json:"error"`
+			}
+			assert.Nil(t, json.NewDecoder(resp.Body).Decode(&errResp))
+			assert.NotEmpty(t, errResp.Error)
+		})
+	}
+}
+
+func TestRecoverToStream(t *testing.T) {
+	ch := make(chan any, 1)
+	func() {
+		defer recoverToStream(ch)
+		panic("boom")
+	}()
+
+	select {
+	case resp := <-ch:
+		assert.Equal(t, gin.H{"error": "internal server error"}, resp)
+	default:
+		t.Fatal("expected an error response after panic")
 	}
 }

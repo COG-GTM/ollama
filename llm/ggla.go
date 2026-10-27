@@ -3,6 +3,7 @@ package llm
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 )
@@ -80,6 +81,10 @@ func (llm *ggla) decode(rs io.ReadSeeker) error {
 		var t Tensor
 		if err := binary.Read(rs, binary.LittleEndian, &t.Kind); err != nil {
 			return err
+		}
+
+		if dims > 4 {
+			return fmt.Errorf("invalid number of tensor dimensions %d (max 4)", dims)
 		}
 
 		t.Shape = make([]uint64, dims)

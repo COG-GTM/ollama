@@ -3,8 +3,10 @@ package llm
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"log/slog"
@@ -204,6 +206,10 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 		}
 
 		shape := [4]uint64{1, 1, 1, 1}
+		if dims > uint32(len(shape)) {
+			return fmt.Errorf("tensor %q: invalid number of dimensions %d (max %d)", name, dims, len(shape))
+		}
+
 		for i := 0; uint32(i) < dims; i++ {
 			shape[i], err = readGGUF[uint64](llm, rs)
 			if err != nil {
@@ -238,6 +244,10 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 	alignment, ok := llm.kv["general.alignment"].(uint32)
 	if !ok {
 		alignment = 32
+	}
+
+	if alignment == 0 || alignment&(alignment-1) != 0 {
+		return fmt.Errorf("invalid general.alignment %d: must be a non-zero power of two", alignment)
 	}
 
 	offset, err := rs.Seek(0, io.SeekCurrent)
@@ -278,10 +288,17 @@ func writeGGUF[V any](llm *gguf, w io.Writer, t uint32, v V) error {
 	return binary.Write(w, llm.ByteOrder, v)
 }
 
+var errGGUFStringLength = errors.New("invalid gguf string length")
+
 func readGGUFV1String(llm *gguf, r io.Reader) (string, error) {
 	var length uint64
 	if err := binary.Read(r, llm.ByteOrder, &length); err != nil {
 		return "", err
+	}
+
+	// gguf v1 strings include a null terminator so they are never empty
+	if length == 0 || length > math.MaxInt64 {
+		return "", fmt.Errorf("%w: %d", errGGUFStringLength, length)
 	}
 
 	var b bytes.Buffer
@@ -303,6 +320,10 @@ func readGGUFString(llm *gguf, r io.Reader) (string, error) {
 	var length uint64
 	if err := binary.Read(r, llm.ByteOrder, &length); err != nil {
 		return "", err
+	}
+
+	if length > math.MaxInt64 {
+		return "", fmt.Errorf("%w: %d", errGGUFStringLength, length)
 	}
 
 	var b bytes.Buffer

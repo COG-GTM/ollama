@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -447,6 +448,7 @@ func (s *Server) PullModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer recoverToStream(ch)
 		fn := func(r api.ProgressResponse) {
 			ch <- r
 		}
@@ -496,6 +498,7 @@ func (s *Server) PushModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer recoverToStream(ch)
 		fn := func(r api.ProgressResponse) {
 			ch <- r
 		}
@@ -518,6 +521,15 @@ func (s *Server) PushModelHandler(c *gin.Context) {
 	}
 
 	streamResponse(c, ch)
+}
+
+// recoverToStream converts a panic in a handler-spawned goroutine into an
+// error response instead of letting it terminate the server process.
+func recoverToStream(ch chan any) {
+	if r := recover(); r != nil {
+		slog.Error("recovered from panic", "error", r, "stack", string(debug.Stack()))
+		ch <- gin.H{"error": "internal server error"}
+	}
 }
 
 func (s *Server) CreateModelHandler(c *gin.Context) {
@@ -573,6 +585,7 @@ func (s *Server) CreateModelHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer recoverToStream(ch)
 		fn := func(resp api.ProgressResponse) {
 			ch <- resp
 		}
