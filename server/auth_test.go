@@ -197,6 +197,49 @@ func TestAuthRedirectToOtherHostRefused(t *testing.T) {
 	}
 }
 
+func TestRedirectedChallengeUsesRespondingHost(t *testing.T) {
+	setupSigningKey(t)
+
+	var tokenHits atomic.Int32
+	var storage *httptest.Server
+	storage = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/token":
+			tokenHits.Add(1)
+			fmt.Fprint(w, `{"token":"storage-token"}`)
+		case r.Header.Get("Authorization") == "Bearer storage-token":
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token"`, storage.URL))
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer storage.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, storage.URL+"/blob", http.StatusTemporaryRedirect)
+	}))
+	defer registry.Close()
+
+	requestURL := mustParseURL(t, registry.URL+"/v2/x/y/blobs/sha256:abc")
+	resp, err := makeRequestWithRetry(context.Background(), http.MethodGet, requestURL, nil, nil, &registryOptions{Insecure: true})
+	if err != nil {
+		t.Fatalf("expected redirected challenge to succeed, got %v", err)
+	}
+	resp.Body.Close()
+
+	if tokenHits.Load() != 1 {
+		t.Fatalf("expected one token request, got %d", tokenHits.Load())
+	}
+}
+
+func TestRedactURL(t *testing.T) {
+	u := mustParseURL(t, "https://user:pass@storage.example/blob/sha256?X-Amz-Signature=secret&X-Amz-Credential=key#frag")
+	if got, want := redactURL(u), "https://storage.example/blob/sha256"; got != want {
+		t.Fatalf("redactURL = %q, want %q", got, want)
+	}
+}
+
 func TestRegistryErrorBody(t *testing.T) {
 	cases := []struct {
 		name        string

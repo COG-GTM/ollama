@@ -173,7 +173,7 @@ func getAuthorizationToken(ctx context.Context, challenge registryChallenge, reg
 	}
 
 	if err := validateRealm(redirectURL, registryURL); err != nil {
-		slog.Warn("refusing registry authentication realm", "registry", registryURL.Host, "realm", redirectURL.Redacted())
+		slog.Warn("refusing registry authentication realm", "registry", registryURL.Host, "realm", redactURL(redirectURL))
 		return "", err
 	}
 

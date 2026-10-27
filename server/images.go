@@ -1196,7 +1196,7 @@ func makeRequestWithRetry(ctx context.Context, method string, requestURL *url.UR
 			// Handle authentication error with one retry
 			resp.Body.Close()
 			challenge := parseRegistryChallenge(resp.Header.Get("www-authenticate"))
-			token, err := getAuthorizationToken(ctx, challenge, requestURL)
+			token, err := getAuthorizationToken(ctx, challenge, resp.Request.URL)
 			if err != nil {
 				return nil, err
 			}
@@ -1293,6 +1293,12 @@ func sanitizeRegistryMessage(s string) string {
 	return s
 }
 
+// redactURL drops userinfo, query and fragment, which may carry credentials
+// such as signed blob storage parameters.
+func redactURL(u *url.URL) string {
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String()
+}
+
 func truncateForLog(body []byte) string {
 	if len(body) > 1024 {
 		body = body[:1024]
@@ -1337,7 +1343,7 @@ func registryError(resp *http.Response) error {
 	}
 
 	if len(messages) == 0 {
-		slog.Debug("registry request failed", "url", resp.Request.URL.Redacted(), "status", resp.StatusCode, "body", truncateForLog(body))
+		slog.Debug("registry request failed", "url", redactURL(resp.Request.URL), "status", resp.StatusCode, "body", truncateForLog(body))
 		return fmt.Errorf("registry responded with %s", statusText(resp.StatusCode))
 	}
 
