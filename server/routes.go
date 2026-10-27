@@ -444,6 +444,11 @@ func (s *Server) PullModelHandler(c *gin.Context) {
 		return
 	}
 
+	if err := ParseModelPath(model).Validate(); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
@@ -490,6 +495,11 @@ func (s *Server) PushModelHandler(c *gin.Context) {
 		model = req.Name
 	} else {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+
+	if err := ParseModelPath(model).Validate(); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -612,6 +622,11 @@ func (s *Server) DeleteModelHandler(c *gin.Context) {
 		model = req.Name
 	} else {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+
+	if err := ParseModelPath(model).Validate(); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
