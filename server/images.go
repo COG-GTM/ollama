@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -819,9 +818,15 @@ func PruneLayers() error {
 
 	for _, blob := range blobs {
 		name := blob.Name()
-		name = strings.ReplaceAll(name, "-", ":")
-		if strings.HasPrefix(name, "sha256:") {
-			deleteMap[name] = struct{}{}
+		switch {
+		case blobDigestPattern.MatchString(name):
+			deleteMap[strings.Replace(name, "-", ":", 1)] = struct{}{}
+		case partialBlobPattern.MatchString(name):
+			// leftovers from an interrupted download are never referenced by a manifest
+			fp := filepath.Join(p, name)
+			if err := os.Remove(fp); err != nil {
+				slog.Info(fmt.Sprintf("couldn't remove file '%s': %v", fp, err))
+			}
 		}
 	}
 
@@ -1131,18 +1136,50 @@ func pullModelManifest(ctx context.Context, mp ModelPath, regOpts *registryOptio
 		return nil, err
 	}
 
-	return m, err
+	if err := validateManifest(m); err != nil {
+		return nil, err
+	}
+
+	return m, nil
+}
+
+// validateManifest rejects manifests whose config or layer digests are not
+// canonical sha256 digests, before any of them are used to build a file path.
+func validateManifest(m *ManifestV2) error {
+	if m == nil {
+		return errors.New("invalid manifest: empty response")
+	}
+
+	if m.Config == nil {
+		return errors.New("invalid manifest: missing config")
+	}
+
+	if err := validateManifestDigest(m.Config.Digest); err != nil {
+		return fmt.Errorf("invalid manifest config: %w", err)
+	}
+
+	for _, layer := range m.Layers {
+		if layer == nil {
+			return errors.New("invalid manifest: empty layer")
+		}
+
+		if err := validateManifestDigest(layer.Digest); err != nil {
+			return fmt.Errorf("invalid manifest layer: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // GetSHA256Digest returns the SHA256 hash of a given buffer and returns it, and the size of buffer
-func GetSHA256Digest(r io.Reader) (string, int64) {
+func GetSHA256Digest(r io.Reader) (string, int64, error) {
 	h := sha256.New()
 	n, err := io.Copy(h, r)
 	if err != nil {
-		log.Fatal(err)
+		return "", n, err
 	}
 
-	return fmt.Sprintf("sha256:%x", h.Sum(nil)), n
+	return fmt.Sprintf("sha256:%x", h.Sum(nil)), n, nil
 }
 
 var errUnauthorized = fmt.Errorf("unauthorized: access denied")
@@ -1313,13 +1350,21 @@ func verifyBlob(digest string) error {
 		return err
 	}
 
+	return verifyFileDigest(fp, digest)
+}
+
+func verifyFileDigest(fp, digest string) error {
 	f, err := os.Open(fp)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	fileDigest, _ := GetSHA256Digest(f)
+	fileDigest, _, err := GetSHA256Digest(f)
+	if err != nil {
+		return err
+	}
+
 	if digest != fileDigest {
 		return fmt.Errorf("%w: want %s, got %s", errDigestMismatch, digest, fileDigest)
 	}

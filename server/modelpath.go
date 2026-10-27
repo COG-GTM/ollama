@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -143,7 +144,44 @@ func GetManifestPath() (string, error) {
 	return path, nil
 }
 
+var (
+	errInvalidDigestFormat = errors.New("invalid digest format")
+
+	// blobDigestPattern matches a blob digest in either its canonical
+	// ("sha256:<hex>") or on-disk ("sha256-<hex>") form.
+	blobDigestPattern     = regexp.MustCompile(`^sha256[:-][0-9a-f]{64}$`)
+	manifestDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	// partialBlobPattern matches the temporary files written while a blob is
+	// being downloaded ("sha256-<hex>-partial" and "sha256-<hex>-partial-<n>").
+	partialBlobPattern = regexp.MustCompile(`^sha256-[0-9a-f]{64}-partial(-[0-9]+)?$`)
+)
+
+func validateBlobDigest(digest string) error {
+	if !blobDigestPattern.MatchString(digest) {
+		return fmt.Errorf("%w: %q", errInvalidDigestFormat, digest)
+	}
+
+	return nil
+}
+
+func validateManifestDigest(digest string) error {
+	if !manifestDigestPattern.MatchString(digest) {
+		return fmt.Errorf("%w: %q", errInvalidDigestFormat, digest)
+	}
+
+	return nil
+}
+
+// GetBlobsPath returns the path to the blob with the given digest, or the
+// blobs directory itself when digest is empty. Any non-empty digest that is not
+// a sha256 digest is rejected so it can never escape the blobs directory.
 func GetBlobsPath(digest string) (string, error) {
+	if digest != "" {
+		if err := validateBlobDigest(digest); err != nil {
+			return "", err
+		}
+	}
+
 	dir, err := modelsDir()
 	if err != nil {
 		return "", err
