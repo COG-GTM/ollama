@@ -547,24 +547,17 @@ func (s *Server) CreateModelHandler(c *gin.Context) {
 		return
 	}
 
-	if req.Path == "" && req.Modelfile == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "path or modelfile are required"})
+	if req.Modelfile == "" {
+		if req.Path != "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "path is not supported, send the Modelfile contents in modelfile"})
+			return
+		}
+
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "modelfile is required"})
 		return
 	}
 
-	var modelfile io.Reader = strings.NewReader(req.Modelfile)
-	if req.Path != "" && req.Modelfile == "" {
-		mf, err := os.Open(req.Path)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("error reading modelfile: %s", err)})
-			return
-		}
-		defer mf.Close()
-
-		modelfile = mf
-	}
-
-	commands, err := parser.Parse(modelfile)
+	commands, err := parser.Parse(strings.NewReader(req.Modelfile))
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -580,7 +573,7 @@ func (s *Server) CreateModelHandler(c *gin.Context) {
 		ctx, cancel := context.WithCancel(c.Request.Context())
 		defer cancel()
 
-		if err := CreateModel(ctx, model, filepath.Dir(req.Path), req.Quantization, commands, fn); err != nil {
+		if err := CreateModel(ctx, model, req.Quantization, commands, fn); err != nil {
 			ch <- gin.H{"error": err.Error()}
 		}
 	}()
@@ -828,6 +821,11 @@ func (s *Server) CopyModelHandler(c *gin.Context) {
 }
 
 func (s *Server) HeadBlobHandler(c *gin.Context) {
+	if !validDigest(c.Param("digest")) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": ErrInvalidDigestFormat.Error()})
+		return
+	}
+
 	path, err := GetBlobsPath(c.Param("digest"))
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -843,6 +841,11 @@ func (s *Server) HeadBlobHandler(c *gin.Context) {
 }
 
 func (s *Server) CreateBlobHandler(c *gin.Context) {
+	if !validDigest(c.Param("digest")) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": ErrInvalidDigestFormat.Error()})
+		return
+	}
+
 	path, err := GetBlobsPath(c.Param("digest"))
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})

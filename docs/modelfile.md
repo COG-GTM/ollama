@@ -121,7 +121,7 @@ A list of available base models:
 FROM ./ollama-model.bin
 ```
 
-This bin file location should be specified as an absolute path or relative to the `Modelfile` location.
+This bin file location should be specified as an absolute path or relative to the `Modelfile` location. `ollama create` uploads the file to the server as a blob; when calling the API directly, upload it with [Create a Blob](./api.md#create-a-blob) and use `FROM @sha256:<digest>`.
 
 ### PARAMETER
 
@@ -180,7 +180,7 @@ SYSTEM """<system message>"""
 
 ### ADAPTER
 
-The `ADAPTER` instruction is an optional instruction that specifies any LoRA adapter that should apply to the base model. The value of this instruction should be an absolute path or a path relative to the Modelfile and the file must be in a GGML file format. The adapter should be tuned from the base model otherwise the behaviour is undefined.
+The `ADAPTER` instruction is an optional instruction that specifies any LoRA adapter that should apply to the base model. The value of this instruction should be an absolute path or a path relative to the Modelfile and the file must be in a GGML file format. `ollama create` uploads the file as a blob; API clients must upload it with [Create a Blob](./api.md#create-a-blob) and use `ADAPTER @sha256:<digest>`. The adapter should be tuned from the base model otherwise the behaviour is undefined.
 
 ```modelfile
 ADAPTER ./ollama-lora.bin

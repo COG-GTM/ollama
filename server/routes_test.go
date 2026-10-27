@@ -53,15 +53,15 @@ func Test_Routes(t *testing.T) {
 	}
 
 	createTestModel := func(t *testing.T, name string) {
-		fname := createTestFile(t, "ollama-model")
+		digest := createTestBlob(t, createTestFile(t, "ollama-model"))
 
-		modelfile := strings.NewReader(fmt.Sprintf("FROM %s\nPARAMETER seed 42\nPARAMETER top_p 0.9\nPARAMETER stop foo\nPARAMETER stop bar", fname))
+		modelfile := strings.NewReader(fmt.Sprintf("FROM @%s\nPARAMETER seed 42\nPARAMETER top_p 0.9\nPARAMETER stop foo\nPARAMETER stop bar", fname))
 		commands, err := parser.Parse(modelfile)
 		assert.Nil(t, err)
 		fn := func(resp api.ProgressResponse) {
 			t.Logf("Status: %s", resp.Status)
 		}
-		err = CreateModel(context.TODO(), name, "", "", commands, fn)
+		err = CreateModel(context.TODO(), name, "", commands, fn)
 		assert.Nil(t, err)
 	}
 
@@ -126,12 +126,12 @@ func Test_Routes(t *testing.T) {
 			Setup: func(t *testing.T, req *http.Request) {
 				f, err := os.CreateTemp(t.TempDir(), "ollama-model")
 				assert.Nil(t, err)
-				defer f.Close()
+				f.Close()
 
 				stream := false
 				createReq := api.CreateRequest{
 					Name:      "t-bone",
-					Modelfile: fmt.Sprintf("FROM %s", f.Name()),
+					Modelfile: fmt.Sprintf("FROM @%s", createTestBlob(t, f.Name())),
 					Stream:    &stream,
 				}
 				jsonData, err := json.Marshal(createReq)

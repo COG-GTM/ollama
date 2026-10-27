@@ -171,9 +171,13 @@ type EmbeddingResponse struct {
 }
 
 type CreateRequest struct {
-	Model        string `json:"model"`
-	Path         string `json:"path"`
-	Modelfile    string `json:"modelfile"`
+	Model     string `json:"model"`
+	Modelfile string `json:"modelfile"`
+
+	// Path is no longer supported: the server rejects requests that set it
+	// without Modelfile. Send the Modelfile contents in Modelfile instead.
+	Path string `json:"path"`
+
 	Stream       *bool  `json:"stream,omitempty"`
 	Quantization string `json:"quantization,omitempty"`
 
