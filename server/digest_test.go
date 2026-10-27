@@ -312,3 +312,39 @@ func TestPullModelSuccess(t *testing.T) {
 		}
 	}
 }
+
+func TestPruneLayersRemovesPartialDownloads(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", filepath.Join(t.TempDir(), "models"))
+
+	dir, err := GetBlobsPath("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unused := strings.Replace(sha256Digest([]byte("unused")), ":", "-", 1)
+	partial := strings.Replace(sha256Digest([]byte("partial")), ":", "-", 1) + "-partial"
+	removed := []string{unused, partial, partial + "-0", partial + "-12"}
+	kept := []string{"unrelated", unused + "-partial-x", "sha256-abc-partial"}
+
+	for _, name := range append(append([]string{}, removed...), kept...) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := PruneLayers(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range removed {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s should have been pruned, stat err = %v", name, err)
+		}
+	}
+
+	for _, name := range kept {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s should not have been pruned: %v", name, err)
+		}
+	}
+}

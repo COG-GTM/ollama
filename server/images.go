@@ -818,9 +818,15 @@ func PruneLayers() error {
 
 	for _, blob := range blobs {
 		name := blob.Name()
-		name = strings.ReplaceAll(name, "-", ":")
-		if strings.HasPrefix(name, "sha256:") {
-			deleteMap[name] = struct{}{}
+		switch {
+		case blobDigestPattern.MatchString(name):
+			deleteMap[strings.Replace(name, "-", ":", 1)] = struct{}{}
+		case partialBlobPattern.MatchString(name):
+			// leftovers from an interrupted download are never referenced by a manifest
+			fp := filepath.Join(p, name)
+			if err := os.Remove(fp); err != nil {
+				slog.Info(fmt.Sprintf("couldn't remove file '%s': %v", fp, err))
+			}
 		}
 	}
 

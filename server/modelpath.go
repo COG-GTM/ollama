@@ -151,6 +151,9 @@ var (
 	// ("sha256:<hex>") or on-disk ("sha256-<hex>") form.
 	blobDigestPattern     = regexp.MustCompile(`^sha256[:-][0-9a-f]{64}$`)
 	manifestDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	// partialBlobPattern matches the temporary files written while a blob is
+	// being downloaded ("sha256-<hex>-partial" and "sha256-<hex>-partial-<n>").
+	partialBlobPattern = regexp.MustCompile(`^sha256-[0-9a-f]{64}-partial(-[0-9]+)?$`)
 )
 
 func validateBlobDigest(digest string) error {
