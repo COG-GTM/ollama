@@ -631,14 +631,13 @@ curl http://localhost:11434/api/chat -d '{
 POST /api/create
 ```
 
-Create a model from a [`Modelfile`](./modelfile.md). It is recommended to set `modelfile` to the content of the Modelfile rather than just set `path`. This is a requirement for remote create. Remote model creation must also create any file blobs, fields such as `FROM` and `ADAPTER`, explicitly with the server using [Create a Blob](#create-a-blob) and the value to the path indicated in the response.
+Create a model from a [`Modelfile`](./modelfile.md). Set `modelfile` to the content of the Modelfile; the server does not read Modelfiles or model files from its own filesystem. Any files referenced by `FROM` or `ADAPTER` must first be uploaded with [Create a Blob](#create-a-blob) and referenced as `@sha256:<digest>` (the `ollama create` CLI does this automatically). `FROM` otherwise takes a model name.
 
 ### Parameters
 
 - `name`: name of the model to create
-- `modelfile` (optional): contents of the Modelfile
+- `modelfile`: contents of the Modelfile
 - `stream`: (optional) if `false` the response will be returned as a single response object, rather than a stream of objects
-- `path` (optional): path to the Modelfile
 
 ### Examples
 

@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"log/slog"
 	"net/http"
@@ -263,32 +262,55 @@ func GetModel(name string) (*Model, error) {
 	return model, nil
 }
 
-func realpath(mfDir, from string) string {
-	abspath, err := filepath.Abs(from)
+var (
+	errUnknownBlob       = errors.New("blob not found, upload it with POST /api/blobs/:digest first")
+	errInvalidModelRef   = errors.New("FROM must be a model name or a blob reference (@sha256:<digest>)")
+	errInvalidAdapterRef = errors.New("ADAPTER must be a blob reference (@sha256:<digest>)")
+)
+
+// blobPath resolves a FROM or ADAPTER argument that refers to a blob already
+// stored on the server, either "@sha256:<digest>" or the absolute blob path
+// printed by `ollama show --modelfile`. Arbitrary server paths are never
+// resolved: Modelfiles arrive over the API and must not probe the filesystem.
+func blobPath(arg string) (string, bool, error) {
+	if digest, ok := strings.CutPrefix(arg, "@"); ok {
+		if !validDigest(digest) {
+			return "", true, fmt.Errorf("%w: %s", errUnknownBlob, arg)
+		}
+
+		p, err := GetBlobsPath(digest)
+		if err != nil {
+			return "", false, err
+		}
+		return p, true, nil
+	}
+
+	if !filepath.IsAbs(arg) {
+		return "", false, nil
+	}
+
+	blobs, err := GetBlobsPath("")
 	if err != nil {
-		return from
+		return "", false, err
 	}
 
-	home, err := os.UserHomeDir()
+	dir, digest := filepath.Split(filepath.Clean(arg))
+	if filepath.Clean(dir) != filepath.Clean(blobs) {
+		return "", false, nil
+	}
+
+	if !validDigest(digest) {
+		return "", true, fmt.Errorf("%w: %s", errUnknownBlob, arg)
+	}
+
+	p, err := GetBlobsPath(digest)
 	if err != nil {
-		return abspath
+		return "", false, err
 	}
-
-	if from == "~" {
-		return home
-	} else if strings.HasPrefix(from, "~/") {
-		return filepath.Join(home, from[2:])
-	}
-
-	if _, err := os.Stat(filepath.Join(mfDir, from)); err == nil {
-		// this is a file relative to the Modelfile
-		return filepath.Join(mfDir, from)
-	}
-
-	return abspath
+	return p, true, nil
 }
 
-func CreateModel(ctx context.Context, name, modelFileDir, quantization string, commands []parser.Command, fn func(resp api.ProgressResponse)) error {
+func CreateModel(ctx context.Context, name, quantization string, commands []parser.Command, fn func(resp api.ProgressResponse)) error {
 	deleteMap := make(map[string]struct{})
 	if manifest, _, err := GetManifest(ParseModelPath(name)); err == nil {
 		for _, layer := range append(manifest.Layers, manifest.Config) {
@@ -315,26 +337,20 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 
 		switch c.Name {
 		case "model":
-			if strings.HasPrefix(c.Args, "@") {
-				blobPath, err := GetBlobsPath(strings.TrimPrefix(c.Args, "@"))
-				if err != nil {
-					return err
-				}
-
-				c.Args = blobPath
+			pathName, isBlob, err := blobPath(c.Args)
+			if err != nil {
+				return err
 			}
 
-			pathName := realpath(modelFileDir, c.Args)
+			var ggufName string
+			if isBlob {
+				if _, err := os.Stat(pathName); err != nil {
+					return fmt.Errorf("%w: %s", errUnknownBlob, c.Args)
+				}
 
-			ggufName, err := convertModel(name, pathName, fn)
-			if err != nil {
-				var pathErr *fs.PathError
-				switch {
-				case errors.Is(err, zip.ErrFormat):
-					// it's not a safetensor archive
-				case errors.As(err, &pathErr):
-					// it's not a file on disk, could be a model reference
-				default:
+				ggufName, err = convertModel(name, pathName, fn)
+				if err != nil && !errors.Is(err, zip.ErrFormat) {
+					// zip.ErrFormat: it's not a safetensor archive
 					return err
 				}
 			}
@@ -364,10 +380,12 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 				}
 			}
 
-			bin, err := os.Open(pathName)
-			if err != nil {
-				// not a file on disk so must be a model reference
+			if !isBlob {
 				modelpath := ParseModelPath(c.Args)
+				if err := modelpath.Validate(); err != nil {
+					return fmt.Errorf("%w: %q", errInvalidModelRef, c.Args)
+				}
+
 				manifest, _, err := GetManifest(modelpath)
 				switch {
 				case errors.Is(err, os.ErrNotExist):
@@ -441,6 +459,11 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 				deleteMap[manifest.Config.Digest] = struct{}{}
 				continue
 			}
+
+			bin, err := os.Open(pathName)
+			if err != nil {
+				return fmt.Errorf("%w: %s", errUnknownBlob, c.Args)
+			}
 			defer bin.Close()
 
 			var offset int64
@@ -480,19 +503,17 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 				offset += size
 			}
 		case "adapter":
-			if strings.HasPrefix(c.Args, "@") {
-				blobPath, err := GetBlobsPath(strings.TrimPrefix(c.Args, "@"))
-				if err != nil {
-					return err
-				}
-
-				c.Args = blobPath
+			pathName, isBlob, err := blobPath(c.Args)
+			if err != nil {
+				return err
+			} else if !isBlob {
+				return fmt.Errorf("%w: %q", errInvalidAdapterRef, c.Args)
 			}
 
 			fn(api.ProgressResponse{Status: "creating adapter layer"})
-			bin, err := os.Open(realpath(modelFileDir, c.Args))
+			bin, err := os.Open(pathName)
 			if err != nil {
-				return err
+				return fmt.Errorf("%w: %s", errUnknownBlob, c.Args)
 			}
 			defer bin.Close()
 

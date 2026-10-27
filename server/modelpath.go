@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -78,6 +79,12 @@ func (mp ModelPath) Validate() error {
 		return fmt.Errorf("%w: ':' (colon) is not allowed in tag names", errModelPathInvalid)
 	}
 
+	for _, part := range []string{mp.Registry, mp.Namespace, mp.Repository, mp.Tag} {
+		if part == "" || part == "." || part == ".." || strings.ContainsAny(part, `/\`) {
+			return fmt.Errorf("%w: %q is not a valid name component", errModelPathInvalid, part)
+		}
+	}
+
 	return nil
 }
 
@@ -141,6 +148,16 @@ func GetManifestPath() (string, error) {
 	}
 
 	return path, nil
+}
+
+var (
+	ErrInvalidDigestFormat = errors.New("invalid digest format")
+
+	digestPattern = regexp.MustCompile(`^sha256[:-][0-9a-fA-F]{64}$`)
+)
+
+func validDigest(digest string) bool {
+	return digestPattern.MatchString(digest)
 }
 
 func GetBlobsPath(digest string) (string, error) {
