@@ -101,6 +101,13 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	if req.Template != "" {
+		if _, err := parseTemplate(req.Template); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid template: %v", err)})
+			return
+		}
+	}
+
 	for _, img := range req.Images {
 		if !isSupportedImageType(img) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "unsupported image format"})
@@ -195,7 +202,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 		p, err := Prompt(req.Template, req.System, sb.String(), "", true)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			status := http.StatusInternalServerError
+			if errors.Is(err, errTemplateLimit) {
+				status = http.StatusBadRequest
+			}
+			c.JSON(status, gin.H{"error": err.Error()})
 			return
 		}
 
