@@ -163,7 +163,7 @@ func (ts Tensors) Layers() map[string]Layer {
 	layers := make(map[string]Layer)
 	for _, t := range ts {
 		parts := strings.Split(t.Name, ".")
-		if parts[0] == "blk" {
+		if parts[0] == "blk" && len(parts) > 1 {
 			// join first and second part, e.g. blk.%d
 			parts = append([]string{fmt.Sprintf("%s.%s", parts[0], parts[1])}, parts[2:]...)
 		}
@@ -329,7 +329,12 @@ func (llm GGML) GraphSize(context, batch uint64) (partialOffload, fullOffload ui
 	embedding := llm.KV().EmbeddingLength()
 	heads := llm.KV().HeadCount()
 	headsKV := llm.KV().HeadCountKV()
-	vocab := uint64(len(llm.KV()["tokenizer.ggml.tokens"].([]any)))
+	tokens, _ := llm.KV()["tokenizer.ggml.tokens"].([]any)
+	vocab := uint64(len(tokens))
+
+	if heads == 0 {
+		return 0, 0
+	}
 
 	layers := llm.Tensors().Layers()
 
@@ -345,14 +350,17 @@ func (llm GGML) GraphSize(context, batch uint64) (partialOffload, fullOffload ui
 
 		if ffnGateExpsWeight, ok := layers["blk.0"]["ffn_gate_exps.weight"]; ok {
 			// mixtral 8x22b
-			ff := uint64(llm.KV()["llama.feed_forward_length"].(uint32))
+			ff := llm.KV().u64("llama.feed_forward_length")
 			partialOffload = max(
 				3*ffnGateExpsWeight.size()+4*batch*(2*ff+headsKV+embedding+context+embedding/heads*headsKV),
 				4*(context*batch*heads+context*embedding/heads*headsKV+batch*1024+embedding/heads*headsKV*batch),
 			)
 		} else if ffnGateWeight, ok := layers["blk.0"]["ffn_gate.0.weight"]; ok {
 			// mixtral 8x7b
-			ffnGateWeight1 := ffnGateWeight.Shape[1]
+			var ffnGateWeight1 uint64
+			if len(ffnGateWeight.Shape) > 1 {
+				ffnGateWeight1 = ffnGateWeight.Shape[1]
+			}
 			fullOffload = 4 * batch * (2 + 3*embedding + context*(1+heads) + 2*headsKV + ffnGateWeight1)
 			partialOffload = max(
 				4*batch*(3+embedding/heads*headsKV+embedding+context*(1+heads)+ffnGateWeight1)+(embedding*embedding+3*embedding*headsKV*ffnGateWeight1)*9/16,

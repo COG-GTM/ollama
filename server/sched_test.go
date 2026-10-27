@@ -627,3 +627,95 @@ func (s *mockLlm) Close() error {
 	return s.closeResp
 }
 func (s *mockLlm) EstimatedVRAM() uint64 { return s.estimatedVRAM }
+
+func TestMalformedModelDoesNotCrashScheduler(t *testing.T) {
+	ctx, done := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer done()
+
+	f, err := os.CreateTemp(t.TempDir(), "malformed-model")
+	require.NoError(t, err)
+	defer f.Close()
+
+	// llama model with no attention.head_count, no tokenizer tokens and a tensor named "blk"
+	gguf := llm.NewGGUFV3(binary.LittleEndian)
+	err = gguf.Encode(f, llm.KV{
+		"general.architecture":   "llama",
+		"llama.context_length":   uint32(32),
+		"llama.embedding_length": uint32(4096),
+		"llama.block_count":      uint32(1),
+	}, []llm.Tensor{
+		{Name: "blk", Kind: uint32(0), Offset: uint64(0), Shape: []uint64{1, 1, 1, 1}, WriterTo: &bytes.Reader{}},
+	})
+	require.NoError(t, err)
+
+	s := InitScheduler(ctx)
+	s.getGpuFn = func() gpu.GpuInfoList {
+		g := gpu.GpuInfo{Library: "cuda"}
+		g.TotalMemory = 24 * format.GigaByte
+		g.FreeMemory = 12 * format.GigaByte
+		return []gpu.GpuInfo{g}
+	}
+	srv := &mockLlm{estimatedVRAM: 10}
+	s.newServerFn = func(gpus gpu.GpuInfoList, model string, ggml *llm.GGML, adapters []string, projectors []string, opts api.Options) (llm.LlamaServer, error) {
+		return srv, nil
+	}
+	s.Run(ctx)
+
+	reqCtx, reqDone := context.WithCancel(ctx)
+	defer reqDone()
+	successCh, errCh := s.GetRunner(reqCtx, &Model{Name: "malformed", ModelPath: f.Name()}, api.DefaultOptions(), 0)
+	select {
+	case resp := <-successCh:
+		require.Equal(t, srv, resp.llama)
+	case err := <-errCh:
+		t.Fatalf("unexpected error %v", err)
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+}
+
+func TestSchedulerRecoversFromLoadPanic(t *testing.T) {
+	ctx, done := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer done()
+
+	scenario := newScenario(t, ctx, "ollama-model-panic", 10)
+	scenario2 := newScenario(t, ctx, "ollama-model-ok", 10)
+	defer scenario.ctxDone()
+	defer scenario2.ctxDone()
+
+	s := InitScheduler(ctx)
+	s.getGpuFn = func() gpu.GpuInfoList {
+		g := gpu.GpuInfo{Library: "cuda"}
+		g.TotalMemory = 24 * format.GigaByte
+		g.FreeMemory = 12 * format.GigaByte
+		return []gpu.GpuInfo{g}
+	}
+	s.newServerFn = func(gpus gpu.GpuInfoList, model string, ggml *llm.GGML, adapters []string, projectors []string, opts api.Options) (llm.LlamaServer, error) {
+		if model == scenario.req.model.ModelPath {
+			panic("boom")
+		}
+		return scenario2.srv, nil
+	}
+	s.Run(ctx)
+
+	successCh, errCh := s.GetRunner(scenario.ctx, scenario.req.model, scenario.req.opts, scenario.req.sessionDuration)
+	select {
+	case resp := <-successCh:
+		t.Fatalf("unexpected success %v", resp)
+	case err := <-errCh:
+		require.Contains(t, err.Error(), "boom")
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+
+	// the scheduler keeps serving requests after the panic
+	successCh, errCh = s.GetRunner(scenario2.ctx, scenario2.req.model, scenario2.req.opts, scenario2.req.sessionDuration)
+	select {
+	case resp := <-successCh:
+		require.Equal(t, scenario2.srv, resp.llama)
+	case err := <-errCh:
+		t.Fatalf("unexpected error %v", err)
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+}
