@@ -116,15 +116,17 @@ func requireHTTPSRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// stageInstallerPath returns where the installer for etag is staged. The etag
-// comes from the download server, so it is hashed instead of being used as a
-// path component, and the file name is always Installer.
-func stageInstallerPath(etag string) (string, error) {
-	dir := "_"
-	if etag != "" {
-		sum := sha256.Sum256([]byte(etag))
-		dir = hex.EncodeToString(sum[:])
+// stageInstallerPath returns where the installer for etag (or downloadURL when
+// the server sends no etag) is staged. Both come from the network, so the key is
+// hashed instead of being used as a path component, and the file name is always
+// Installer.
+func stageInstallerPath(etag, downloadURL string) (string, error) {
+	key := "etag:" + etag
+	if etag == "" {
+		key = "url:" + downloadURL
 	}
+	sum := sha256.Sum256([]byte(key))
+	dir := hex.EncodeToString(sum[:])
 
 	stageFilename := filepath.Join(UpdateStageDir, dir, Installer)
 	rel, err := filepath.Rel(UpdateStageDir, stageFilename)
@@ -159,10 +161,10 @@ func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
 	}
 	etag := strings.Trim(resp.Header.Get("etag"), "\"")
 	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup")
+		slog.Debug("no etag detected, falling back to url based dedup")
 	}
 
-	stageFilename, err := stageInstallerPath(etag)
+	stageFilename, err := stageInstallerPath(etag, downloadURL.String())
 	if err != nil {
 		return err
 	}

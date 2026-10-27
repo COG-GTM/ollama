@@ -98,11 +98,12 @@ func TestDownloadNewReleaseStaysInStageDir(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			root, srv := setupUpdateTest(t, tc)
 
-			if err := DownloadNewRelease(context.Background(), UpdateResponse{UpdateURL: srv.URL + "/download/OllamaSetup.exe"}); err != nil {
+			downloadURL := srv.URL + "/download/OllamaSetup.exe"
+			if err := DownloadNewRelease(context.Background(), UpdateResponse{UpdateURL: downloadURL}); err != nil {
 				t.Fatal(err)
 			}
 
-			want, err := stageInstallerPath(tc.headEtag)
+			want, err := stageInstallerPath(tc.headEtag, downloadURL)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,6 +136,20 @@ func TestDownloadNewReleaseSkipsExistingDownload(t *testing.T) {
 	}
 	if n := s.gets.Load(); n != 1 {
 		t.Fatalf("expected 1 GET, got %d", n)
+	}
+}
+
+func TestDownloadNewReleaseWithoutEtagKeysOnURL(t *testing.T) {
+	s := &updateServer{}
+	_, srv := setupUpdateTest(t, s)
+
+	for _, v := range []string{"v0.1.1", "v0.1.2", "v0.1.2"} {
+		if err := DownloadNewRelease(context.Background(), UpdateResponse{UpdateURL: srv.URL + "/download/" + v + "/OllamaSetup.exe"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := s.gets.Load(); n != 2 {
+		t.Fatalf("expected 2 GETs, got %d", n)
 	}
 }
 
