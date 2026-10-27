@@ -260,7 +260,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				if !req.Raw {
 					p, err := Prompt(req.Template, req.System, req.Prompt, generated.String(), false)
 					if err != nil {
-						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+						ch <- gin.H{"error": err.Error()}
 						return
 					}
 

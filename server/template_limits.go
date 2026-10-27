@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"text/template"
@@ -264,11 +265,13 @@ func formatWidths(format string, args []any) int {
 			case c == '*':
 				total += star
 			case c >= '0' && c <= '9':
+				// fmt accepts literal widths and precisions up to ~1e7, so
+				// saturate well above that and let the budget reject them.
 				var n int
 				for ; i+1 < len(format) && format[i+1] >= '0' && format[i+1] <= '9'; i++ {
-					n = min(n*10+int(format[i]-'0'), maxFormatWidth)
+					n = min(n*10+int(format[i]-'0'), math.MaxInt32)
 				}
-				total += min(n*10+int(format[i]-'0'), maxFormatWidth)
+				total += min(n*10+int(format[i]-'0'), math.MaxInt32)
 			case strings.IndexByte("+-# .[]", c) >= 0:
 			default:
 				break verb
