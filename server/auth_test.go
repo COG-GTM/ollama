@@ -233,6 +233,43 @@ func TestRedirectedChallengeUsesRespondingHost(t *testing.T) {
 	}
 }
 
+func TestRedirectedUploadUnauthorizedDoesNotPanic(t *testing.T) {
+	setupSigningKey(t)
+
+	var tokenHits atomic.Int32
+	var storage *httptest.Server
+	storage = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			tokenHits.Add(1)
+			fmt.Fprint(w, `{"token":"t"}`)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token"`, storage.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer storage.Close()
+
+	f, err := os.CreateTemp(t.TempDir(), "blob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("data"); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &blobUpload{Layer: &Layer{Digest: "sha256:abc"}, file: f}
+	part := &blobUploadPart{Size: 4}
+	err = b.uploadPart(context.Background(), http.MethodPut, mustParseURL(t, storage.URL+"/upload"), part, nil)
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("expected 401 error, got %v", err)
+	}
+
+	if tokenHits.Load() != 0 {
+		t.Fatalf("redirected upload requested a token")
+	}
+}
+
 func TestRedactURL(t *testing.T) {
 	u := mustParseURL(t, "https://user:pass@storage.example/blob/sha256?X-Amz-Signature=secret&X-Amz-Credential=key#frag")
 	if got, want := redactURL(u), "https://storage.example/blob/sha256"; got != want {

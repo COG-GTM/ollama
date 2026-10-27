@@ -272,7 +272,7 @@ func (b *blobUpload) uploadPart(ctx context.Context, method string, requestURL *
 
 		return fmt.Errorf("%w: %w", errMaxRetriesExceeded, err)
 
-	case resp.StatusCode == http.StatusUnauthorized:
+	case resp.StatusCode == http.StatusUnauthorized && opts != nil:
 		w.Rollback()
 		challenge := parseRegistryChallenge(resp.Header.Get("www-authenticate"))
 		token, err := getAuthorizationToken(ctx, challenge, resp.Request.URL)
