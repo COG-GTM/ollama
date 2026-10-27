@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/ollama/ollama/api"
@@ -152,6 +153,34 @@ func Test_Routes(t *testing.T) {
 			},
 		},
 		{
+			Name:   "Create Model Handler (reserved parameter name)",
+			Method: http.MethodPost,
+			Path:   "/api/create",
+			Setup: func(t *testing.T, req *http.Request) {
+				createTestModel(t, "base-model")
+
+				stream := false
+				createReq := api.CreateRequest{
+					Name:      "message-param",
+					Modelfile: "FROM base-model\nPARAMETER message hello",
+					Stream:    &stream,
+				}
+				jsonData, err := json.Marshal(createReq)
+				assert.Nil(t, err)
+
+				req.Body = io.NopCloser(bytes.NewReader(jsonData))
+			},
+			Expected: func(t *testing.T, resp *http.Response) {
+				body, err := io.ReadAll(resp.Body)
+				assert.Nil(t, err)
+				assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+				assert.Contains(t, string(body), "reserved command")
+
+				_, err = GetModel("message-param")
+				assert.NotNil(t, err)
+			},
+		},
+		{
 			Name:   "Copy Model Handler",
 			Method: http.MethodPost,
 			Path:   "/api/copy",
@@ -240,4 +269,42 @@ func Test_Routes(t *testing.T) {
 		}
 
 	}
+}
+
+func Test_CreateModel_MalformedMessage(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	f, err := os.CreateTemp(t.TempDir(), "ollama-model")
+	assert.Nil(t, err)
+	assert.Nil(t, binary.Write(f, binary.LittleEndian, []byte("GGUF")))
+	assert.Nil(t, binary.Write(f, binary.LittleEndian, uint32(3)))
+	assert.Nil(t, binary.Write(f, binary.LittleEndian, uint64(0)))
+	assert.Nil(t, binary.Write(f, binary.LittleEndian, uint64(0)))
+	assert.Nil(t, f.Close())
+
+	commands := []parser.Command{
+		{Name: "model", Args: f.Name()},
+		{Name: "message", Args: "hello"},
+	}
+
+	fn := func(resp api.ProgressResponse) {}
+	assert.NotPanics(t, func() {
+		err = CreateModel(context.TODO(), "malformed-message", "", "", commands, fn)
+	})
+	assert.ErrorContains(t, err, "invalid message")
+}
+
+func Test_RecoverStreamPanic(t *testing.T) {
+	ch := make(chan any, 1)
+	go func() {
+		defer close(ch)
+		defer recoverStreamPanic(ch)
+		panic("boom")
+	}()
+
+	resp, ok := <-ch
+	assert.True(t, ok)
+	assert.Equal(t, gin.H{"error": "internal error: boom"}, resp)
+	_, ok = <-ch
+	assert.False(t, ok)
 }

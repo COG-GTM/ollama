@@ -96,3 +96,21 @@ MESSAGE badguy I'm a bad guy!
 	_, err := Parse(reader)
 	assert.ErrorContains(t, err, "role must be one of \"system\", \"user\", or \"assistant\"")
 }
+
+func Test_Parser_ReservedParameterName(t *testing.T) {
+	for _, name := range []string{"message", "MESSAGE", "model", "adapter", "license", "template", "system", "prompt"} {
+		input := "FROM foo\nPARAMETER " + name + " hello\n"
+
+		_, err := Parse(strings.NewReader(input))
+		assert.ErrorContains(t, err, "reserved command", name)
+	}
+}
+
+func Test_Parser_MissingCommandValue(t *testing.T) {
+	for _, command := range []string{"FROM", "ADAPTER", "LICENSE", "TEMPLATE", "SYSTEM", "PROMPT", "PARAMETER", "MESSAGE"} {
+		input := "FROM foo\n" + command + "\n"
+
+		_, err := Parse(strings.NewReader(input))
+		assert.ErrorContains(t, err, "missing value for "+command, command)
+	}
+}

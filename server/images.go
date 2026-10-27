@@ -542,8 +542,12 @@ func CreateModel(ctx context.Context, name, modelFileDir, quantization string, c
 
 		for _, m := range messages {
 			// todo: handle images
-			msg := strings.SplitN(m, ": ", 2)
-			msgs = append(msgs, api.Message{Role: msg[0], Content: msg[1]})
+			role, content, ok := strings.Cut(m, ": ")
+			if !ok {
+				return fmt.Errorf("invalid message %q: should be in the format <role>: <message>", m)
+			}
+
+			msgs = append(msgs, api.Message{Role: role, Content: content})
 		}
 
 		var b bytes.Buffer

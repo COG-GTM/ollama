@@ -20,6 +20,10 @@ func (c *Command) Reset() {
 	c.Args = ""
 }
 
+// reservedParameterNames are command names produced by other Modelfile
+// instructions; a PARAMETER with one of these names would be mistaken for them.
+var reservedParameterNames = []string{"model", "adapter", "license", "template", "system", "prompt", "message"}
+
 func Parse(reader io.Reader) ([]Command, error) {
 	var commands []Command
 	var command, modelCommand Command
@@ -33,6 +37,13 @@ func Parse(reader io.Reader) ([]Command, error) {
 		fields := bytes.SplitN(line, []byte(" "), 2)
 		if len(fields) == 0 || len(fields[0]) == 0 {
 			continue
+		}
+
+		switch name := string(bytes.ToUpper(fields[0])); name {
+		case "FROM", "ADAPTER", "LICENSE", "TEMPLATE", "SYSTEM", "PROMPT", "PARAMETER", "MESSAGE":
+			if len(fields) < 2 {
+				return nil, fmt.Errorf("missing value for %s", name)
+			}
 		}
 
 		switch string(bytes.ToUpper(fields[0])) {
@@ -51,6 +62,10 @@ func Parse(reader io.Reader) ([]Command, error) {
 			fields = bytes.SplitN(fields[1], []byte(" "), 2)
 			if len(fields) < 2 {
 				return nil, fmt.Errorf("missing value for %s", fields)
+			}
+
+			if slices.Contains(reservedParameterNames, string(bytes.ToLower(fields[0]))) {
+				return nil, fmt.Errorf("invalid parameter name: %s is a reserved command", fields[0])
 			}
 
 			command.Name = string(fields[0])
