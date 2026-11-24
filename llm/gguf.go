@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -139,14 +140,22 @@ func (llm *gguf) numKV() uint64 {
 }
 
 func (llm *gguf) Decode(rs io.ReadSeeker) error {
+	start, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	// metadata is many small fields: buffer them instead of one read syscall per field
+	r := &countingReader{r: bufio.NewReaderSize(rs, 64<<10)}
+
 	// decode key-values
 	for i := 0; uint64(i) < llm.numKV(); i++ {
-		k, err := readGGUFString(llm, rs)
+		k, err := readGGUFString(llm, r)
 		if err != nil {
 			return err
 		}
 
-		t, err := readGGUF[uint32](llm, rs)
+		t, err := readGGUF[uint32](llm, r)
 		if err != nil {
 			return err
 		}
@@ -154,31 +163,31 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 		var v any
 		switch t {
 		case ggufTypeUint8:
-			v, err = readGGUF[uint8](llm, rs)
+			v, err = readGGUF[uint8](llm, r)
 		case ggufTypeInt8:
-			v, err = readGGUF[int8](llm, rs)
+			v, err = readGGUF[int8](llm, r)
 		case ggufTypeUint16:
-			v, err = readGGUF[uint16](llm, rs)
+			v, err = readGGUF[uint16](llm, r)
 		case ggufTypeInt16:
-			v, err = readGGUF[int16](llm, rs)
+			v, err = readGGUF[int16](llm, r)
 		case ggufTypeUint32:
-			v, err = readGGUF[uint32](llm, rs)
+			v, err = readGGUF[uint32](llm, r)
 		case ggufTypeInt32:
-			v, err = readGGUF[int32](llm, rs)
+			v, err = readGGUF[int32](llm, r)
 		case ggufTypeUint64:
-			v, err = readGGUF[uint64](llm, rs)
+			v, err = readGGUF[uint64](llm, r)
 		case ggufTypeInt64:
-			v, err = readGGUF[int64](llm, rs)
+			v, err = readGGUF[int64](llm, r)
 		case ggufTypeFloat32:
-			v, err = readGGUF[float32](llm, rs)
+			v, err = readGGUF[float32](llm, r)
 		case ggufTypeFloat64:
-			v, err = readGGUF[float64](llm, rs)
+			v, err = readGGUF[float64](llm, r)
 		case ggufTypeBool:
-			v, err = readGGUF[bool](llm, rs)
+			v, err = readGGUF[bool](llm, r)
 		case ggufTypeString:
-			v, err = readGGUFString(llm, rs)
+			v, err = readGGUFString(llm, r)
 		case ggufTypeArray:
-			v, err = readGGUFArray(llm, rs)
+			v, err = readGGUFArray(llm, r)
 		default:
 			return fmt.Errorf("invalid type: %d", t)
 		}
@@ -192,31 +201,31 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 
 	// decode tensors
 	for i := 0; uint64(i) < llm.numTensor(); i++ {
-		name, err := readGGUFString(llm, rs)
+		name, err := readGGUFString(llm, r)
 		if err != nil {
 			return err
 		}
 
 		// dims is the number of dimensions in the tensor
-		dims, err := readGGUF[uint32](llm, rs)
+		dims, err := readGGUF[uint32](llm, r)
 		if err != nil {
 			return err
 		}
 
 		shape := [4]uint64{1, 1, 1, 1}
 		for i := 0; uint32(i) < dims; i++ {
-			shape[i], err = readGGUF[uint64](llm, rs)
+			shape[i], err = readGGUF[uint64](llm, r)
 			if err != nil {
 				return err
 			}
 		}
 
-		kind, err := readGGUF[uint32](llm, rs)
+		kind, err := readGGUF[uint32](llm, r)
 		if err != nil {
 			return err
 		}
 
-		offset, err := readGGUF[uint64](llm, rs)
+		offset, err := readGGUF[uint64](llm, r)
 		if err != nil {
 			return err
 		}
@@ -240,7 +249,8 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 		alignment = 32
 	}
 
-	offset, err := rs.Seek(0, io.SeekCurrent)
+	// drop the buffered read-ahead: continue right after the consumed metadata
+	offset, err := rs.Seek(start+r.n, io.SeekStart)
 	if err != nil {
 		return err
 	}
@@ -658,4 +668,15 @@ func (llm *gguf) Encode(ws io.WriteSeeker, kv KV, tensors []Tensor) error {
 
 func (gguf) padding(offset, align int64) int64 {
 	return (align - offset%align) % align
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
